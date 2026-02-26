@@ -17,11 +17,14 @@ import (
 )
 
 const (
-	//备份队列
+	// 备份队列
 	QueueBackupZSet    = "queue:backup"
 	QueueBackupDataFmt = "queue:backup:data:%s"
-	//死信队列
+	// 死信队列
 	QueueDead = "queue:dead_letter"
+	// WatchDog 分布式锁：同一 batchID 同一时刻只允许一个实例处理
+	queueWatchdogLockFmt = "queue:watchdog:lock:%s"
+	watchdogLockTTL      = 120 * time.Second // 锁过期时间；留出足够余量以应对 Pod 崩溃场景
 )
 
 // 统一的任务封装格式
@@ -96,10 +99,10 @@ func (s *TaskScheduler) Dispatch(ctx context.Context, taskName string, batchSize
 	now := time.Now().Unix()
 	dataKey := fmt.Sprintf(QueueBackupDataFmt, batchID)
 
-	// 执行 Lua 脚本
+	// 执行 Lua 脚本：原子完成「出队 + 注册超时哨兵」，dataKey 由 Go 端统一写入。
 	cmd := s.rdb.Eval(ctx, dispatchScript,
-		[]string{cfg.SourceQueue, QueueBackupZSet, QueueDead},
-		batchSize, batchID, now, cfg.Timeout, dataKey, cfg.MaxRetry,
+		[]string{cfg.SourceQueue, QueueBackupZSet},
+		batchSize, batchID, now, cfg.Timeout,
 	)
 	result, err := cmd.Result()
 	if err != nil {
@@ -310,14 +313,34 @@ func (s *TaskScheduler) checkTimeouts(ctx context.Context) {
 			return
 		}
 
+		// ── 分布式锁：多实例场景下，只有成功 SetNX 的那一个实例才处理该批次，
+		//    其余实例直接跳过，从根本上杜绝重复投递。
+		//    若持锁实例崩溃，锁在 watchdogLockTTL 后自动释放，
+		//    下一个 WatchDog 周期会由新实例重新抢占并处理。
+		lockKey := fmt.Sprintf(queueWatchdogLockFmt, batchID)
+		locked, err := s.rdb.SetNX(ctx, lockKey, "1", watchdogLockTTL).Result()
+		if err != nil {
+			log.Printf("[WatchDog] 获取分布式锁失败 batchID=%s: %v", batchID, err)
+			continue
+		}
+		if !locked {
+			// 其他实例已持锁，跳过
+			continue
+		}
+
 		dataKey := fmt.Sprintf(QueueBackupDataFmt, batchID)
 		val, err := s.rdb.Get(ctx, dataKey).Result()
 		if err == redis.Nil {
-			s.rdb.ZRem(ctx, QueueBackupZSet, batchID)
+			// 备份数据已不存在（可能已被 HandleResponse 正常 ACK），清理残留哨兵和锁
+			pipe := s.rdb.Pipeline()
+			pipe.ZRem(ctx, QueueBackupZSet, batchID)
+			pipe.Del(ctx, lockKey)
+			pipe.Exec(ctx) //nolint:errcheck
 			continue
 		}
 		if err != nil {
 			log.Printf("[WatchDog] 读取备份数据失败 batchID=%s: %v", batchID, err)
+			s.rdb.Del(ctx, lockKey) //nolint:errcheck
 			continue
 		}
 
@@ -327,6 +350,7 @@ func (s *TaskScheduler) checkTimeouts(ctx context.Context) {
 			pipe := s.rdb.Pipeline()
 			pipe.ZRem(ctx, QueueBackupZSet, batchID)
 			pipe.Del(ctx, dataKey)
+			pipe.Del(ctx, lockKey)
 			pipe.Exec(ctx) //nolint:errcheck
 			continue
 		}
@@ -338,6 +362,7 @@ func (s *TaskScheduler) checkTimeouts(ctx context.Context) {
 			pipe := s.rdb.Pipeline()
 			pipe.ZRem(ctx, QueueBackupZSet, batchID)
 			pipe.Del(ctx, dataKey)
+			pipe.Del(ctx, lockKey)
 			pipe.Exec(ctx) //nolint:errcheck
 			continue
 		}
@@ -357,10 +382,11 @@ func (s *TaskScheduler) checkTimeouts(ctx context.Context) {
 			s.rdb.LPush(ctx, entry.SourceQueue, args...)
 		}
 
-		// 清理备份记录
+		// 清理备份记录并释放分布式锁（原子执行）
 		pipe := s.rdb.Pipeline()
 		pipe.ZRem(ctx, QueueBackupZSet, batchID)
 		pipe.Del(ctx, dataKey)
+		pipe.Del(ctx, lockKey)
 		pipe.Exec(ctx) //nolint:errcheck
 	}
 }
