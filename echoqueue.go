@@ -99,10 +99,9 @@ func (s *TaskScheduler) Dispatch(ctx context.Context, taskName string, batchSize
 	now := time.Now().Unix()
 	dataKey := fmt.Sprintf(QueueBackupDataFmt, batchID)
 
-	// 执行 Lua 脚本：原子完成「出队 + 注册超时哨兵」，dataKey 由 Go 端统一写入。
 	cmd := s.rdb.Eval(ctx, dispatchScript,
-		[]string{cfg.SourceQueue, QueueBackupZSet},
-		batchSize, batchID, now, cfg.Timeout,
+		[]string{cfg.SourceQueue, QueueBackupZSet, dataKey},       // KEYS
+		batchSize, batchID, now, cfg.Timeout, cfg.SourceQueue, cfg.MaxRetry, // ARGV
 	)
 	result, err := cmd.Result()
 	if err != nil {
@@ -116,46 +115,21 @@ func (s *TaskScheduler) Dispatch(ctx context.Context, taskName string, batchSize
 		return "", nil, nil
 	}
 
-	// 将原始任务数据封装为 TaskEnvelope
+	// 解析 Lua 返回的 TaskEnvelope JSON 列表
 	envelopes := make([]TaskEnvelope, 0, len(itemsInterface))
 	for _, item := range itemsInterface {
 		raw, ok := item.(string)
 		if !ok {
 			raw = fmt.Sprintf("%v", item)
 		}
-		envelopes = append(envelopes, wrapOrParseEnvelope(raw))
-	}
-	deadline := now + int64(len(envelopes)*cfg.Timeout)
-	ttl := time.Duration(deadline-now+3600) * time.Second
-	entry := BackupEntry{
-		Tasks:       envelopes,
-		SourceQueue: cfg.SourceQueue,
-		MaxRetry:    cfg.MaxRetry,
-	}
-	entryJSON, err := json.Marshal(entry)
-	if err != nil {
-		return "", nil, fmt.Errorf("序列化备份资料失败: %w", err)
-	}
-	if err := s.rdb.Set(ctx, dataKey, string(entryJSON), ttl).Err(); err != nil {
-		return "", nil, fmt.Errorf("储存备份资料失败: %w", err)
+		var env TaskEnvelope
+		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+			continue
+		}
+		envelopes = append(envelopes, env)
 	}
 
 	return batchID, envelopes, nil
-}
-
-// 解析原始字符串。
-// 若已是合法的 TaskEnvelope（含有非空 task_id）则直接返回；
-// 否则视为用户的原始 Payload，生成新的 TaskEnvelope 进行封装。
-func wrapOrParseEnvelope(raw string) TaskEnvelope {
-	var env TaskEnvelope
-	if err := json.Unmarshal([]byte(raw), &env); err == nil && env.TaskID != "" {
-		return env // 重试回流任务，保留原有封装
-	}
-	return TaskEnvelope{
-		TaskID:     uuid.New().String(),
-		RetryCount: 0,
-		Payload:    json.RawMessage(raw),
-	}
 }
 
 // 生成BatchID
