@@ -1,3 +1,4 @@
+// TODO(private-release): replace the placeholder with the actual private module path.
 module example.com/m
 
 go 1.25.5
@@ -5,7 +6,6 @@ go 1.25.5
 require (
 	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.18.0
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
