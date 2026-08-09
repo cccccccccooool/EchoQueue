@@ -16,6 +16,12 @@ var settleScript string
 
 var errSettle = errors.New("echoqueue: settle failed")
 
+// errResultTooLarge is the internal, unexported marker for Settle outcomes
+// whose Result data exceeds the configured byte limits. Oversized results are
+// rejected before any Redis capability probe, Pending read, or Lua call, so
+// Pending, deadline, Receipt, and effect lists are never touched.
+var errResultTooLarge = errors.New("echoqueue: result exceeds configured size limit")
+
 // Settle accepts a batch ID and worker outcome. The pending snapshot supplies
 // the queue and policy, so callers never repeat task or routing information.
 func (s *Scheduler) Settle(ctx context.Context, batchID string, outcome Outcome) (Receipt, error) {
@@ -29,6 +35,9 @@ func (s *Scheduler) Settle(ctx context.Context, batchID string, outcome Outcome)
 		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %v", errSettle, err)
 	}
 	if err := outcome.validate(); err != nil {
+		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %v", errSettle, err)
+	}
+	if err := validateOutcomeResultSizes(s.config.MaxPayloadBytes, s.config.MaxBatchBytes, outcome); err != nil {
 		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %v", errSettle, err)
 	}
 	if err := s.ensureRedis(ctx); err != nil {
@@ -105,6 +114,27 @@ func (s *Scheduler) Settle(ctx context.Context, batchID string, outcome Outcome)
 	return parseReceiptResponse(batchID, value, errSettle)
 }
 
+// validateOutcomeResultSizes enforces the same byte limits Dispatch applies to
+// task payloads: each Result.Data must fit within maxPayloadBytes and the sum
+// of all Result.Data in the outcome must fit within maxBatchBytes. Sizes are
+// measured as the raw JSON bytes of Result.Data, and the total is accumulated
+// with a remaining-budget that can never overflow. Failure entries are not
+// counted because they reference payloads already limited at Dispatch time.
+func validateOutcomeResultSizes(maxPayloadBytes, maxBatchBytes int, outcome Outcome) error {
+	remaining := maxBatchBytes
+	for _, result := range outcome.Results {
+		size := len(result.Data)
+		if size > maxPayloadBytes {
+			return fmt.Errorf("%w: result task_id %q is %d bytes, exceeds max_payload_bytes %d", errResultTooLarge, result.TaskID, size, maxPayloadBytes)
+		}
+		if size > remaining {
+			return fmt.Errorf("%w: result data for outcome totals %d bytes, exceeds max_batch_bytes %d", errResultTooLarge, maxBatchBytes-remaining+size, maxBatchBytes)
+		}
+		remaining -= size
+	}
+	return nil
+}
+
 func buildOutcomeEffects(snapshot pendingSnapshot, outcome Outcome) ([]resultRecord, []Task, []deadRecord, error) {
 	tasks := make(map[string]Task, len(snapshot.Tasks))
 	for _, task := range snapshot.Tasks {
@@ -171,14 +201,26 @@ func parseReceiptResponse(batchID string, value interface{}, operationErr error)
 	}
 	status := ReceiptStatus(statusText)
 	receipt := Receipt{Status: status, BatchID: batchID}
-	if len(parts) > 1 {
-		if raw, rawErr := scriptString(parts[1]); rawErr == nil && raw != "" {
-			stored, decodeErr := decodeStoredReceipt(raw)
-			if decodeErr != nil {
-				return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: receipt: %v", operationErr, decodeErr)
-			}
-			receipt = publicReceipt(stored, status)
+	switch status {
+	case ReceiptApplied, ReceiptDuplicate, ReceiptConflict, ReceiptStale:
+		if len(parts) < 2 {
+			return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: receipt is missing", operationErr)
 		}
+		raw, rawErr := scriptString(parts[1])
+		if rawErr != nil || raw == "" {
+			return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: receipt response: %v", operationErr, rawErr)
+		}
+		stored, decodeErr := decodeStoredReceipt(raw)
+		if decodeErr != nil {
+			return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: receipt: %v", operationErr, decodeErr)
+		}
+		receipt = publicReceipt(stored, status)
+	case ReceiptNotFound, ReceiptNotDue:
+		// These statuses intentionally carry no stored receipt.
+	case ReceiptInvalid:
+		// The error text is handled below.
+	default:
+		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: unknown script status %q", operationErr, status)
 	}
 	if status == ReceiptInvalid {
 		message := "script rejected command"
