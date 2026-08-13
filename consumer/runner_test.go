@@ -83,6 +83,7 @@ func (r *dispatchRecorder) Dispatch(ctx context.Context, batchSize int) (echoque
 		r.mu.Unlock()
 		return echoqueue.Batch{}, r.err
 	}
+	batch := r.batch
 	r.inflight++
 	if r.inflight > r.peak {
 		r.peak = r.inflight
@@ -94,7 +95,7 @@ func (r *dispatchRecorder) Dispatch(ctx context.Context, batchSize int) (echoque
 	r.mu.Lock()
 	r.inflight--
 	r.mu.Unlock()
-	return r.batch, nil
+	return batch, nil
 }
 
 func (r *dispatchRecorder) callCount() int64 {
