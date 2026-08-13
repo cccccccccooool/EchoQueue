@@ -1,10 +1,11 @@
 # EchoQueue
 
-> **项目定位：个人自用。** EchoQueue 是为个人项目和中小型任务设计的轻量 Redis 批处理 Go 库，不是通用消息队列、分布式任务平台或大型生产基础设施。使用前应确认业务能够接受 At-Least-Once 语义并实现幂等处理。
+EchoQueue 是一个以 Redis 为载体的轻量级批处理库，面向个人项目与中小型任务规模。它提供 **At-Least-Once** 交付语义：允许幂等重复，不允许静默丢失。它不是通用消息队列、分布式任务平台或大型生产基础设施；使用前应确认业务能够接受该语义，并按 TaskID/effect_id 实现幂等处理。
 
-EchoQueue 以 Redis List 为输入输出载体、以 Lua 脚本完成批次原子边界，交付语义为 **At-Least-Once**：允许幂等重复，不允许静默丢失。
-
-目标环境：**Redis 6.2+ standalone 或 replication primary**。不支持 Redis Cluster、Streams、服务化与外部配置中心。
+- **输入输出载体**：Redis List（Source 为输入，Result/Dead 为输出）。
+- **原子边界**：Dispatch、Settle、Recover 的关键竞态由 Redis Lua 原子脚本统一裁决。
+- **目标环境**：Redis 6.2+ standalone 或 replication primary（`cluster_enabled=0`）。不支持 Redis Cluster、Streams、服务化与外部配置中心。
+- **术语约定**：宿主（host）指集成并运行本库的应用程序；批次（batch）指一次 Dispatch 原子取得的一组任务；EffectID 是 Result/Dead 记录的幂等键。
 
 ## 目录
 
@@ -24,13 +25,13 @@ EchoQueue 以 Redis List 为输入输出载体、以 Lua 脚本完成批次原�
 
 ## 特性
 
-- **Lua 原子闭环**：Dispatch、Settle、Recover 的关键竞态全部由 Redis Lua 原子脚本裁决，不使用 mock 或内存替代协议。
-- **不可变 Pending 快照**：Dispatch 时固化批次配置与任务数据，不设置普通 TTL；Settle 不需要调用方重复路由信息。
-- **Receipt 首终态栅栏**：第一个合法 Settle 或 Recover 获胜，其余请求按 `duplicate` / `conflict` / `stale` 分类。
-- **结果大小硬限制**：超限结果在访问 Redis 之前被拒绝，不写 Effect、不写 Receipt、不删除 Pending/deadline、不做分片拆分。
-- **宿主 Consumer 流水线参考**：permit 先行、Dispatcher/Handler/Settler/in-flight 全硬上限、Settle 熔断、关闭与世代守卫，仅作宿主范式，不扩张核心 API。
-- **Dead 可靠归档参考**：durable claim（BLMOVE）→ 外部幂等持久化 → 成功后 ACK 删除，崩溃窗口最多造成幂等重复。
-- **真实 Redis 测试套件**：integration build tag 全量使用真实 Redis 6.2+，覆盖竞态、随机顺序、race 与故障窗口。
+- **Lua 原子闭环**：Dispatch、Settle、Recover 的关键竞态由 Redis Lua 原子脚本统一裁决，不使用 mock 或内存替代协议。
+- **不可变 Pending 快照**：Dispatch 固化批次配置与任务数据，不设常规 TTL；Settle 无需宿主重复携带路由信息。
+- **Receipt 首终态栅栏**：首个合法 Settle 或 Recover 获胜，其余请求按 `duplicate` / `conflict` / `stale` 分类。
+- **结果大小硬限制**：超限结果在访问 Redis 前被拒绝，不产生任何 Effect/Receipt 写入，不删除 Pending/deadline，也不做拆分存储。
+- **Consumer 分阶段流水线**：`consumer/` 包提供 Dispatcher/Handler/Settler 三阶段有界并发与 Settle 熔断，作为宿主集成范式，不扩张核心 API。
+- **Dead 可靠归档**：durable claim（BLMOVE）→ 外部幂等持久化 → 成功后 ACK 删除；崩溃窗口仅造成幂等重复。
+- **真实 Redis 测试套件**：`integration` build tag 全量使用真实 Redis 6.2+，覆盖竞态、随机顺序、race 与故障窗口。
 
 ## 安装与依赖
 
@@ -97,7 +98,7 @@ if batch.ID != "" {
 }
 ```
 
-宿主负责把任务 JSON 写入 `QueueConfig.Source` List。任务应包含稳定的 `task_id`、`retry_count` 和 `payload`；没有 `task_id` 的原始 JSON 会在当前批次内生成稳定 ID。业务副作用必须按 TaskID 做幂等处理。
+宿主负责将任务 JSON 写入 `QueueConfig.Source` List。任务应包含稳定的 `task_id`、`retry_count` 与 `payload`；不含 `task_id` 的原始 JSON 会在当前批次内生成稳定的批次内 ID。业务副作用必须按 TaskID 做幂等处理。
 
 超时恢复由 Scheduler 生命周期负责：
 
@@ -117,8 +118,8 @@ if err := eq.Run(runCtx); err != nil {
 ```mermaid
 flowchart LR
     S["Source List"] --> D["Dispatch + 不可变 Pending 快照"]
-    D --> W["宿主 Worker"]
-    W --> T["Settle"]
+    D --> H["Handler（业务处理）"]
+    H --> T["Settle"]
     D --> R["Recover（超时接管）"]
     T --> O["Result / Retry(回 Source) / Dead"]
     R --> O
@@ -128,13 +129,13 @@ flowchart LR
 | 概念 | Redis 载体 | 作用 |
 | --- | --- | --- |
 | Source | List（宿主提供） | 任务输入；Dispatch 从尾部消费 |
-| Pending | String（不可变，无普通 TTL） | 批次事实快照：路由、MaxRetry、任务、时间戳 |
+| Pending | String（不可变，无常规 TTL） | 批次事实快照：路由、MaxRetry、任务、时间戳 |
 | Deadline | ZSET | 恢复索引，只作调度参考，不是事实来源 |
 | Receipt | String（有限 PX TTL） | 终态栅栏与重复判定 |
 | Result / Dead | List（宿主或内部默认） | 终态效果记录，含 TaskID 与 EffectID |
 | DeadProcessing | List（归档器专用） | 领取后的 durable claim |
 
-合法 Receipt、损坏 Receipt、孤儿 deadline（无 Pending 无 Receipt）和损坏 Pending 是不同状态：合法 Receipt 可原子清理残留 deadline；孤儿 deadline 可清理；损坏 Receipt 或损坏 Pending 必须保留证据。所有交付均为 At-Least-Once，业务副作用必须按 TaskID/effect_id 幂等。
+合法 Receipt、损坏 Receipt、孤儿 deadline（无 Pending 且无 Receipt）与损坏 Pending 是不同状态：合法 Receipt 可原子清理残留 deadline；孤儿 deadline 可清理；损坏 Receipt 或损坏 Pending 必须保留证据。所有交付均为 At-Least-Once，业务副作用必须按 TaskID/effect_id 幂等。
 
 ## 配置参考
 
@@ -144,8 +145,8 @@ flowchart LR
 | --- | --- | --- |
 | `Namespace` | 必填 | 命名空间，用于内部 key 前缀（RawURL base64 编码） |
 | `VisibilityTimeout` | 30s | 批次可见性超时；≥1ms |
-| `ReceiptTTL` | 24h | 终态重复判定窗口；≥1ms。Pending 不设置普通 TTL |
-| `MaxRetry` | 3 | 普通失败重试上限；`MaxRetrySet=true` 且 `MaxRetry=0` 表示明确不重试 |
+| `ReceiptTTL` | 24h | 终态重复判定窗口；≥1ms。Pending 不设常规 TTL |
+| `MaxRetry` | 3 | 可重试失败上限；`MaxRetrySet=true` 且 `MaxRetry=0` 表示明确不重试 |
 | `MaxRetrySet` | true | 区分“显式 0”与“未指定” |
 | `MaxBatchSize` | 1000 | 单次 Dispatch 最大任务数 |
 | `MaxPayloadBytes` | 1 MiB | 单个任务 payload / 单个 `Result.Data` 最大原始 JSON 字节 |
@@ -162,12 +163,12 @@ flowchart LR
 | `Result` | 否 | 结果 List key；空则使用 namespace 内部默认 List |
 | `Dead` | 否 | 死信 List key；空则使用 namespace 内部默认 List |
 
-约定：
+使用约定：
 
-- 使用 `DefaultConfig()` 取得默认值，再修改 namespace、重试和安全上限。
-- `MaxRetry=0` 必须同时设置 `MaxRetrySet=true`，以区别于“未指定、采用默认重试次数”。
+- 使用 `DefaultConfig()` 取得默认值，再修改 namespace、重试与安全上限。
+- `MaxRetry=0` 必须同时设置 `MaxRetrySet=true`，以区别于“未指定而采用默认重试次数”。
 - `Bind` 拒绝重复 TaskName，以及跨 Queue 或同一 Queue 内 Source/Result/Dead 的有效物理 Redis key 冲突。
-- Bind 后修改调用方 `QueueConfig` 不影响已创建的不可变 Queue。
+- Bind 后修改宿主持有的 `QueueConfig` 不影响已创建的不可变 Queue。
 
 ## API 概览
 
@@ -186,7 +187,7 @@ flowchart LR
 - Receipt 状态：`applied`（本请求获胜）、`duplicate`（相同 request + 相同 command hash）、`conflict`（相同 request + 不同 hash）、`stale`（超时恢复后的迟到响应）、`not_found`、`not_due`、`invalid`。
 - Result/Dead 记录包含 TaskID 与 EffectID，交付语义 At-Least-Once。
 - Redis 能力检查按 Scheduler 缓存成功结果；首次失败不永久缓存，后续操作可重试。只接受 Redis 6.2+ 且 Cluster 未启用。
-- 普通失败重试立即回到 Source，不提供 Retry ZSet、退避调度、quarantine、events、reconcile 或完整观测平台。
+- 可重试失败会立即回到 Source；不提供 Retry ZSet、退避调度、quarantine、事件通知、对账或完整观测平台。
 
 ## 结果大小限制
 
@@ -205,7 +206,7 @@ Settle 在第一次访问 Redis 之前校验每个 `Result.Data` 的原始 JSON 
 
 ## 有界消费（Consumer 分阶段流水线）
 
-`consumer/` 包提供可导入的分阶段消费流水线：**Dispatcher → 有界 Batch Channel → Handler → 有界 Outcome Channel → Settler**，三个阶段并发数独立可配，共享全局 `MaxInFlight` 配额。`cmd/echoqueue-worker/` 是可编译、可直接运行的宿主参考程序，演示如何用现有公开 API 构造有界消费与 Dead 归档，不扩张 EchoQueue 核心 API 或 Config。批次调用顺序必须固定：
+`consumer/` 包提供可导入的分阶段消费流水线：**Dispatcher → 有界 Batch Channel → Handler → 有界 Outcome Channel → Settler**，三个阶段并发数独立可配，共享全局 `MaxInFlight` 配额。`cmd/echoqueue-worker/` 是可编译运行的可执行示例，演示如何用公开 API 组装有界消费与 Dead 归档，不扩张 EchoQueue 核心 API 或 Config。批次调用顺序必须固定：
 
 ```text
 Acquire global permit
@@ -233,7 +234,7 @@ runner, err := consumer.New(consumer.Config{
 - permit 与 batch slot 在 Dispatch 之前取得：流水线满时停止 Dispatch，任务留在 Source；已 Dispatch 批次总能立即进入有界通道。
 - Dispatcher/Handler/Settler/in-flight 批次全部硬上限；慢 Handler 形成背压而非无界预取。Dispatchers 超过 1~4 通常无益，Redis Lua 在服务端串行执行。
 - Settle 连续失败 3 次触发熔断：暂停 Dispatch，按带抖动的 ErrorBackoff 半开探测，Settle 成功后恢复，避免 Redis 故障期间无界预取。只有包装 `echoqueue.ErrTransientRedis` 的瞬时 Redis 交互错误计数熔断，校验/业务拒绝（`ReceiptInvalid`）不计数。
-- 注意：半开探测会以 ErrorBackoff 间隔消耗真实任务（探测批次若 Settle 仍失败，由 Recover 重投直至 MaxRetry 后进 Dead）；完全宕机时探测在 Dispatch 阶段即失败、不消耗任务。若无法接受抖动期死信消耗，应调大 ErrorBackoff。
+- 注意：半开探测会以 ErrorBackoff 间隔消耗真实任务（探测批次若 Settle 仍失败，由 Recover 重投直至 MaxRetry 后进 Dead）；完全宕机时探测在 Dispatch 阶段即失败、不消耗任务。无法接受抖动期死信消耗的宿主可通过增大 ErrorBackoff 降低消耗。
 - Dispatch 后进程退出：批次已有 Pending/deadline，由 Recover 接管；流水线只是背压与短期缓冲，不是可靠状态来源。
 - 关闭：context 取消后停止新 Dispatch；Handler/Settler 在 ShutdownGrace 内排干已 Dispatch 批次与已计算 Outcome，超时后剩余批次连同容量归还、交由 Recover。世代守卫保证旧世代 outcome 不跨代结算。
 - 注意：排干期间 Handler 会继续完成已取得的批次，业务副作用可能在 context 取消后仍然发生；需要严格停止语义的宿主应在 Handler 内部检查自己的业务 context。
@@ -249,7 +250,7 @@ runner.ResizeDispatchers(4)
 runner.ResizeSettlers(8)
 ```
 
-- 扩容立即生效；缩容只在其完成当前单位工作（一个 Dispatch 周期、一个批次的 Handle 及 Outcome 交接、或一个 Settle）后退场。若退场时 Outcome 缓冲已满（settler 跟不上），退场 handler 会放弃该批交给 Recover（批次已 Dispatch，Pending/deadline 在 Redis），绝不无限期阻塞 Resize 调用方。
+- 扩容立即生效；缩容只在其完成当前单位工作（一个 Dispatch 周期、一个批次的 Handle 及 Outcome 交接、或一个 Settle）后退场。若退场时 Outcome 缓冲已满（settler 跟不上），退场 handler 会放弃该批交给 Recover（批次已 Dispatch，Pending/deadline 在 Redis），不会无限期阻塞 Resize 调用。
 - 调整发生在 Run 之间时只更新目标值，下一次 Run 启动按新值建池。
 - 参数范围为 1~1024；`MaxInFlight`/缓冲区容量不随 Resize 改变（调优优先改配置重启）。
 - 注意：熔断打开时扩容 Dispatchers 会按倍数放大半开探测速率（探测消耗真实任务）；无视 context 取消的 Handle/Settle/Dispatch 回调仍会导致缩容等待其完成（与 Run 的 ShutdownGrace 行为一致）。
@@ -278,7 +279,7 @@ go run ./cmd/echoqueue-worker -addr 127.0.0.1:6379
 - 启动恢复按固定窗口分页读取遗留 DeadProcessing，Go 内存有界。
 - 初版只允许一个活动归档器，不实现分布式归档锁；只处理显式配置的 Dead List，不扩张到 Result 或 Retry。
 
-参考程序默认**不启动**归档器；显式启用时使用仅演示的日志 Sink（返回错误、永不删除记录）：
+`cmd/echoqueue-worker` 默认**不启动**归档器；显式启用时使用仅演示的日志 Sink（返回错误、永不删除记录）：
 
 ```powershell
 go run ./cmd/echoqueue-worker -enable-archive -addr 127.0.0.1:6379
@@ -313,7 +314,7 @@ go test -race -tags=integration ./... -count=1
 
 ## 性能基线
 
-**使用建议：本项目仅推荐承担个人项目和中小型任务。** 适合任务规模、峰值积压和故障恢复窗口均可控，且宿主能够提供 Redis 容量监控、业务幂等和人工处理 Dead 记录的场景。若任务持续高并发、积压不可预测、要求多节点水平扩展或严格 SLA，应选择成熟的消息队列或任务平台，而不是依据下述本机压测数字直接扩容使用 EchoQueue。
+**适用边界**：本库面向任务规模、峰值积压与故障恢复窗口均可控，且宿主能提供 Redis 容量监控、业务幂等与人工处理 Dead 记录的场景。若任务持续高并发、积压不可预测、需要多节点水平扩展或严格 SLA，应选用成熟的消息队列或任务平台；下述压测数字仅为本机观测，不作为扩容依据。
 
 性能脚本位于 `scripts/run-performance.ps1`，只使用唯一 namespace 与宿主 List，结束后只清理本轮数据，不执行 `FLUSHDB`：
 
@@ -321,9 +322,9 @@ go test -race -tags=integration ./... -count=1
 ./scripts/run-performance.ps1 -RedisAddress 127.0.0.1:6380
 ```
 
-默认基线包含连续消费、预灌后间隔消费，以及 1x/4x/8x 并发生产与消费压力场景。最近一次本地 Redis 基线处理 72,000 个逻辑任务、73,440 次投递尝试，连续消费约 13,948/s，20ms 间隔消费约 3,759/s，8x 压力消费约 18,958/s；Result 唯一任务数 72,000，Dead 0，Source 余量 0。追加的 8x/16x/32x 边界观察在 32x 时约 21,575/s，仍未出现错误，但这只是当前机器的观测结果，不代表推荐容量、系统极限或 SLA。
+默认基线包含连续消费、预灌后间隔消费，以及 1x/4x/8x 并发生产与消费压力场景。本机 Redis 6.2 基线：处理 72,000 个逻辑任务、73,440 次投递尝试，连续消费约 13,948/s，20ms 间隔消费约 3,759/s，8x 压力消费约 18,958/s；Result 唯一任务数 72,000，Dead 0，Source 余量 0。追加的 8x/16x/32x 边界观察在 32x 时约 21,575/s，未出现错误。
 
-压测会在每个逻辑任务首次投递时按默认 2% 注入一次可恢复失败，用于验证重试链路；最近基线的整体重试率为 2.00%，重试投递率为 1.96%，丢失率为 0.0000%。这里的丢失率定义为最终未出现在唯一 Result 或 Dead 记录中的逻辑任务比例。该吞吐是当前本机 Docker Redis 的可复现实验基线，不是生产容量承诺；交付语义仍是 At-Least-Once，不是 Exactly Once。
+压测会在每个逻辑任务首次投递时按默认 2% 注入一次可恢复失败，用于验证重试链路；最近基线整体重试率 2.00%，重试投递率 1.96%，丢失率 0.0000%。丢失率定义为最终未出现在唯一 Result 或 Dead 记录中的逻辑任务比例。该吞吐是当前本机 Docker Redis 的可复现实验基线，不是生产容量承诺；交付语义仍是 At-Least-Once，不是 Exactly Once。
 
 独立验收补充（2026-08-09，**Redis 8.8.0 本机容器**）：`scripts/perf_harness` 在 150,000 逻辑任务（5 场景、2% 重试注入、batch 64）下唯一 Result 150,000、Dead 0、丢失率 0.0000%，8 并发消费吞吐约 18,359/s；20,000 任务延迟压测中 Dispatch P95 约 8.8ms、Settle P95 约 15.1ms。
 
@@ -337,7 +338,7 @@ go test -race -tags=integration ./... -count=1
 go run ./scripts/consumer_matrix -tasks 30000 -batch-size 32
 ```
 
-最近一次本机 Redis 6.2 基线（每格 30,000 任务、batch 32、MaxInFlight 16、BatchBuffer/OutcomeBuffer 8，**每格重复 3 次取均值**，2026-08-13）：
+本机 Redis 6.2 基线（每格 30,000 任务、batch 32、MaxInFlight 16、BatchBuffer/OutcomeBuffer 8，**每格重复 3 次取均值**，2026-08-13）：
 
 | 配置 DxWxS | 吞吐 tasks/s（3 次均值） | Settle p50 | Settle p99 |
 |---|---|---|---|
@@ -350,13 +351,20 @@ go run ./scripts/consumer_matrix -tasks 30000 -batch-size 32
 | 8x16x8 | 17,425 | 9.4ms | 15.0ms |
 | 16x16x8 | 17,430 | 9.4ms | 15.0ms |
 
-调优结论（只引用单变量对比对）：增加 Settlers 从 2→4 时吞吐约 +46%（4x8x2→4x8x4）；Dispatchers 1→2（1x4x2→2x4x2）与 8→16（8x16x8→16x16x8）均持平，batch 32 下增加 Dispatcher 无收益；高并发下 Settle p50/p99 随队列深度同步上升。吞吐在约 17k tasks/s 处饱和，符合单 Redis 串行执行上限。矩阵无丢失、Dead 0。该数字只是当前机器的观测结果，不代表推荐容量、系统极限或 SLA；单次运行的格间噪声约 ±3%，最高并发格（8x16x8）观测到 ±8% 波动，对机器负载敏感。复测（2026-08-14）关键格三均值：1x4x2 约 11.5k、4x8x4 约 16.2k、8x16x8 约 16.2k（8x16x8 的 6 次观测均值 16.8k，与基线差异落在其自身波动带内，不能判定为回归）。
+**调优结论**（仅引用单变量对比对）：
+
+- Settlers 2→4（4x8x2→4x8x4）：吞吐约 +46%。
+- Dispatchers 1→2 与 8→16：无收益（batch 32 下）。
+- 高并发下 Settle p50/p99 随队列深度同步上升，吞吐约 17k tasks/s 处饱和，符合单 Redis 串行执行上限。
+- 全部格子零丢失、Dead 0。
+
+**复测与噪声**：关键格复测（每格 3 次均值）1x4x2 约 11.5k、4x8x4 约 16.2k、8x16x8 约 16.2k。单次运行格间噪声约 ±3%，最高并发格（8x16x8）6 次观测波动 ±8%，对机器负载敏感；8x16x8 复测与基线（约 17.4k）的差异落在其自身波动带内，无确定性回归。上述数字均为本机观测，不代表推荐容量、系统极限或 SLA。
 
 ## 已知限制
 
 - 交付语义为 At-Least-Once：业务副作用必须按 TaskID/effect_id 幂等，不允许 Exactly Once 假设。
-- 不提供 Retry ZSet、指数退避、quarantine、events、reconcile 或完整观测平台；普通失败立即回 Source。
+- 不提供 Retry ZSet、指数退避、quarantine、事件通知、对账或完整观测平台；可重试失败立即回到 Source。
 - 不提供 YAML 主配置、V1/V2 双轨、复杂迁移、服务化、Web UI 或多租户。
 - Redis OOM 或进程硬杀不保证跨系统完整回滚；必须监控容量并设置外部背压。
-- 大型结果不拆分：必须使用外部存储引用。
-- Dead 归档器初版为单活动实例，无分布式锁。
+- 大型结果不拆分存储：必须使用外部存储引用。
+- Dead 归档器为单活动实例，无分布式锁。
