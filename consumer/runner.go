@@ -20,6 +20,7 @@ package consumer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -155,8 +156,8 @@ func New(cfg Config) (*Runner, error) {
 // next Run. Shrinking retires workers only after they finish their current
 // unit of work, so no dispatched batch is ever abandoned by a resize.
 func (r *Runner) ResizeDispatchers(n int) error {
-	if n < 1 {
-		return errors.New("echoqueue consumer: dispatchers must be positive")
+	if n < 1 || n > maxStageWorkers {
+		return fmt.Errorf("echoqueue consumer: dispatchers must be between 1 and %d", maxStageWorkers)
 	}
 	r.desiredDispatchers.Store(int64(n))
 	r.poolMu.Lock()
@@ -171,8 +172,8 @@ func (r *Runner) ResizeDispatchers(n int) error {
 // ResizeWorkers changes the number of handler goroutines. See
 // ResizeDispatchers for the lifetime semantics.
 func (r *Runner) ResizeWorkers(n int) error {
-	if n < 1 {
-		return errors.New("echoqueue consumer: workers must be positive")
+	if n < 1 || n > maxStageWorkers {
+		return fmt.Errorf("echoqueue consumer: workers must be between 1 and %d", maxStageWorkers)
 	}
 	r.desiredWorkers.Store(int64(n))
 	r.poolMu.Lock()
@@ -187,8 +188,8 @@ func (r *Runner) ResizeWorkers(n int) error {
 // ResizeSettlers changes the number of settle goroutines. See
 // ResizeDispatchers for the lifetime semantics.
 func (r *Runner) ResizeSettlers(n int) error {
-	if n < 1 {
-		return errors.New("echoqueue consumer: settlers must be positive")
+	if n < 1 || n > maxStageWorkers {
+		return fmt.Errorf("echoqueue consumer: settlers must be between 1 and %d", maxStageWorkers)
 	}
 	r.desiredSettlers.Store(int64(n))
 	r.poolMu.Lock()
@@ -319,17 +320,28 @@ func (r *Runner) Run(ctx context.Context, dispatch BatchDispatcher, settle Batch
 	defer grace.Stop()
 	select {
 	case <-coordinated:
+		// The graceful drain completed. Scavenge once as well: a worker
+		// spawned by a Resize that raced the coordinator's snapshot may
+		// still have delivered one batch after the last handler drained.
+		r.scavenge()
 		return nil
 	case <-grace.C:
 		cancelRun()
 	}
 
 	// Return the permits and slots of any batches abandoned to Recover so a
-	// restarted Run starts with full capacity. The sends below can never
-	// block: every abandoned batch holds exactly one token of each channel,
-	// and the abandoned batch count never exceeds the token capacities.
-	// Batches held by handlers or settlers that ignore cancellation are not
-	// counted and their tokens stay with the stuck goroutine.
+	// restarted Run starts with full capacity.
+	r.scavenge()
+	return nil
+}
+
+// scavenge returns the permits and slots of any batches still buffered in
+// the shared channels. The sends below can never block: every buffered
+// batch holds exactly one token of each channel, and the buffered batch
+// count never exceeds the token capacities. Batches held by handlers or
+// settlers that ignore cancellation are not counted and their tokens stay
+// with the stuck goroutine.
+func (r *Runner) scavenge() {
 	for {
 		select {
 		case <-r.batches:
@@ -339,7 +351,7 @@ func (r *Runner) Run(ctx context.Context, dispatch BatchDispatcher, settle Batch
 			r.slots <- struct{}{}
 			r.permits <- struct{}{}
 		default:
-			return nil
+			return
 		}
 	}
 }

@@ -1261,6 +1261,192 @@ func TestRunnerResizeDuringShutdown(t *testing.T) {
 	pollUntil(t, 2*time.Second, "token restoration", func() bool { return len(runner.permits) == 3 && len(runner.slots) == 3 })
 }
 
+func TestRunnerResizeReturnsWhenHandlerBlockedOnOutcome(t *testing.T) {
+	// The C-1 regression: a settling worker stuck in the host Settle leaves
+	// the single outcome slot occupied, a handler blocks handing its outcome
+	// over, and shrinking must still return in bounded time (the retiring
+	// handler abandons the batch to Recover instead of blocking forever).
+	runner, err := New(Config{
+		Dispatchers:   1,
+		Workers:       2,
+		Settlers:      1,
+		MaxInFlight:   2,
+		BatchSize:     1,
+		BatchBuffer:   2,
+		OutcomeBuffer: 1,
+		PollInterval:  time.Millisecond,
+		ErrorBackoff:  time.Millisecond,
+		ShutdownGrace: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	dispatch := &dispatchRecorder{batch: echoqueue.Batch{ID: "b", Tasks: []echoqueue.Task{{TaskID: "t", Payload: []byte(`{}`)}}}}
+	settle := &settleRecorder{}
+	settleGate := make(chan struct{})
+	var settleOnce sync.Once
+	blockingSettle := &blockingSettler{gate: settleGate, once: &settleOnce, calls: &settle.calls}
+	handle := func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome { return okOutcome(batch) }
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx, dispatch, blockingSettle, handle, func(error) {}) }()
+	// One settle is stuck inside Settle; the second outcome is computed and
+	// its handler blocks on the full outcome channel.
+	pollUntil(t, 2*time.Second, "settler stuck and outcome blocked", func() bool {
+		return settle.calls.Load() >= 1 && len(runner.outcomes) == 1
+	})
+	resizeDone := make(chan error, 1)
+	go func() { resizeDone <- runner.ResizeWorkers(1) }()
+	select {
+	case err := <-resizeDone:
+		if err != nil {
+			t.Fatalf("ResizeWorkers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ResizeWorkers blocked forever while a handler waited on a full outcome channel")
+	}
+	close(settleGate)
+	pollUntil(t, 2*time.Second, "settles resume", func() bool { return settle.calls.Load() >= 2 })
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	pollUntil(t, 2*time.Second, "token restoration", func() bool { return len(runner.permits) == 2 && len(runner.slots) == 2 })
+}
+
+func TestRunnerConcurrentResizeRaces(t *testing.T) {
+	runner, err := New(Config{
+		Dispatchers:   1,
+		Workers:       2,
+		Settlers:      1,
+		MaxInFlight:   6,
+		BatchSize:     1,
+		BatchBuffer:   6,
+		OutcomeBuffer: 6,
+		PollInterval:  time.Millisecond,
+		ErrorBackoff:  time.Millisecond,
+		ShutdownGrace: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	dispatch := &dispatchRecorder{batch: echoqueue.Batch{ID: "b", Tasks: []echoqueue.Task{{TaskID: "t", Payload: []byte(`{}`)}}}}
+	settle := &settleRecorder{}
+	handle := func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome { return okOutcome(batch) }
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx, dispatch, settle, handle, func(error) {}) }()
+	pollUntil(t, 2*time.Second, "pipeline flowing", func() bool { return settle.calls.Load() >= 3 })
+
+	var wg sync.WaitGroup
+	resizeErr := make(chan error, 16)
+	flip := func(resize func(int) error, low, high int, rounds int) {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			if err := resize(low); err != nil {
+				resizeErr <- err
+				return
+			}
+			if err := resize(high); err != nil {
+				resizeErr <- err
+				return
+			}
+		}
+	}
+	wg.Add(3)
+	go flip(runner.ResizeWorkers, 1, 3, 40)
+	go flip(runner.ResizeSettlers, 1, 2, 40)
+	go flip(runner.ResizeDispatchers, 1, 2, 40)
+	wg.Wait()
+	close(resizeErr)
+	for err := range resizeErr {
+		t.Fatalf("concurrent resize: %v", err)
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	pollUntil(t, 2*time.Second, "token restoration", func() bool { return len(runner.permits) == 6 && len(runner.slots) == 6 })
+}
+
+func TestRunnerCancelResizeRaceRestoresAllTokens(t *testing.T) {
+	// The M-1 regression: cancel racing a Resize that spawns after the
+	// coordinator's snapshot must still end every Run with full tokens, on
+	// both the graceful and the grace-expiry path.
+	for i := 0; i < 10; i++ {
+		runner := quickRunner(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		dispatch := &dispatchRecorder{batch: echoqueue.Batch{ID: "b", Tasks: []echoqueue.Task{{TaskID: "t", Payload: []byte(`{}`)}}}}
+		settle := &settleRecorder{}
+		handle := func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome { return okOutcome(batch) }
+		runDone := make(chan error, 1)
+		go func() { runDone <- runner.Run(ctx, dispatch, settle, handle, func(error) {}) }()
+		pollUntil(t, 2*time.Second, "pipeline flowing", func() bool { return settle.calls.Load() >= 2 })
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = runner.ResizeDispatchers(2)
+		}()
+		go func() {
+			defer wg.Done()
+			cancel()
+		}()
+		wg.Wait()
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Fatalf("Run = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("Run did not stop")
+		}
+		if got := len(runner.permits); got != 3 {
+			t.Fatalf("iteration %d: permits after shutdown = %d, want 3", i, got)
+		}
+		if got := len(runner.slots); got != 3 {
+			t.Fatalf("iteration %d: slots after shutdown = %d, want 3", i, got)
+		}
+	}
+}
+
+func TestRunnerResizeAndConfigUpperBound(t *testing.T) {
+	if _, err := New(Config{Workers: maxStageWorkers + 1}); err == nil {
+		t.Fatal("config above the stage upper bound was accepted")
+	}
+	if _, err := New(Config{Dispatchers: maxStageWorkers + 1}); err == nil {
+		t.Fatal("config above the stage upper bound was accepted")
+	}
+	if _, err := New(Config{Settlers: maxStageWorkers + 1}); err == nil {
+		t.Fatal("config above the stage upper bound was accepted")
+	}
+	runner := quickRunner(t)
+	if err := runner.ResizeWorkers(maxStageWorkers + 1); err == nil {
+		t.Fatal("resize above the stage upper bound was accepted")
+	}
+	if err := runner.ResizeDispatchers(maxStageWorkers + 1); err == nil {
+		t.Fatal("resize above the stage upper bound was accepted")
+	}
+	if err := runner.ResizeSettlers(maxStageWorkers + 1); err == nil {
+		t.Fatal("resize above the stage upper bound was accepted")
+	}
+	// The boundary value itself is legal; without an active Run it only
+	// updates the remembered size, spawning nothing.
+	if err := runner.ResizeWorkers(maxStageWorkers); err != nil {
+		t.Fatalf("resize at the upper bound: %v", err)
+	}
+}
+
 func TestRunnerConfigValidation(t *testing.T) {
 	if _, err := New(Config{}); err != nil {
 		t.Fatalf("zero config: %v", err)

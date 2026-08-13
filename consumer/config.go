@@ -7,6 +7,7 @@ package consumer
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -67,6 +68,12 @@ func DefaultConfig() Config {
 	}
 }
 
+// maxStageWorkers bounds every stage size. It protects the host from
+// accidental self-inflicted OOM (goroutine stacks and channels grow linearly
+// with the count) while leaving plenty of headroom above any practical
+// Redis-serialized pipeline size.
+const maxStageWorkers = 1024
+
 func (c Config) validated() (Config, error) {
 	defaults := DefaultConfig()
 	if c.Dispatchers == 0 {
@@ -101,6 +108,9 @@ func (c Config) validated() (Config, error) {
 	}
 	if c.Dispatchers <= 0 || c.Workers <= 0 || c.Settlers <= 0 || c.MaxInFlight <= 0 || c.BatchSize <= 0 || c.BatchBuffer <= 0 || c.OutcomeBuffer <= 0 {
 		return Config{}, errors.New("echoqueue consumer: dispatchers, workers, settlers, max_in_flight, batch_size, batch_buffer, and outcome_buffer must be positive")
+	}
+	if c.Dispatchers > maxStageWorkers || c.Workers > maxStageWorkers || c.Settlers > maxStageWorkers {
+		return Config{}, fmt.Errorf("echoqueue consumer: dispatchers, workers, and settlers must not exceed %d", maxStageWorkers)
 	}
 	if c.PollInterval <= 0 || c.ErrorBackoff <= 0 || c.ShutdownGrace <= 0 {
 		return Config{}, errors.New("echoqueue consumer: poll_interval, error_backoff, and shutdown_grace must be positive")

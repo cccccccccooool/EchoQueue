@@ -249,9 +249,10 @@ runner.ResizeDispatchers(4)
 runner.ResizeSettlers(8)
 ```
 
-- 扩容立即生效；缩容只在其完成当前单位工作（一个 Dispatch 周期、一个批次的 Handle 及 Outcome 交接、或一个 Settle）后退场，不放弃已持有的批次。
+- 扩容立即生效；缩容只在其完成当前单位工作（一个 Dispatch 周期、一个批次的 Handle 及 Outcome 交接、或一个 Settle）后退场。若退场时 Outcome 缓冲已满（settler 跟不上），退场 handler 会放弃该批交给 Recover（批次已 Dispatch，Pending/deadline 在 Redis），绝不无限期阻塞 Resize 调用方。
 - 调整发生在 Run 之间时只更新目标值，下一次 Run 启动按新值建池。
-- 参数必须 ≥ 1；`MaxInFlight`/缓冲区容量不随 Resize 改变（调优优先改配置重启）。
+- 参数范围为 1~1024；`MaxInFlight`/缓冲区容量不随 Resize 改变（调优优先改配置重启）。
+- 注意：熔断打开时扩容 Dispatchers 会按倍数放大半开探测速率（探测消耗真实任务）；无视 context 取消的 Handle/Settle/Dispatch 回调仍会导致缩容等待其完成（与 Run 的 ShutdownGrace 行为一致）。
 
 ```powershell
 go run ./cmd/echoqueue-worker -addr 127.0.0.1:6379

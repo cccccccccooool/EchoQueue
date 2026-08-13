@@ -25,7 +25,7 @@ func (r *Runner) workerLoop(runCtx context.Context, gen int64, handle BatchHandl
 			r.drainBatches(runCtx, gen, handle, quit)
 			return
 		case batch := <-r.batches:
-			r.workBatch(runCtx, gen, batch, handle)
+			r.workBatch(runCtx, gen, batch, handle, quit)
 		}
 	}
 }
@@ -41,7 +41,7 @@ func (r *Runner) drainBatches(runCtx context.Context, gen int64, handle BatchHan
 		case <-quit:
 			return
 		case batch := <-r.batches:
-			r.workBatch(runCtx, gen, batch, handle)
+			r.workBatch(runCtx, gen, batch, handle, quit)
 		default:
 			return
 		}
@@ -54,10 +54,13 @@ func (r *Runner) drainBatches(runCtx context.Context, gen int64, handle BatchHan
 //
 // The permit and batch slot travel with the batch from Dispatch to Settle,
 // so whoever closes the batch releases them: the settler after a normal
-// settle, this handler when the batch is abandoned to Recover. The deferred
-// release also covers a panicking host handle callback, so a panic can never
-// permanently shrink the token pools.
-func (r *Runner) workBatch(runCtx context.Context, gen int64, batch echoqueue.Batch, handle BatchHandler) {
+// settle, this handler when the batch is abandoned to Recover. A retiring
+// handler that is blocked handing the outcome over while the outcome buffer
+// is full abandons the batch to Recover instead of blocking Resize forever:
+// the batch was already dispatched, so Pending/deadline remain in Redis and
+// Recover closes it. The deferred release also covers a panicking host
+// handle callback, so a panic can never permanently shrink the token pools.
+func (r *Runner) workBatch(runCtx context.Context, gen int64, batch echoqueue.Batch, handle BatchHandler, quit <-chan struct{}) {
 	released := false
 	defer func() {
 		if !released {
@@ -80,6 +83,9 @@ func (r *Runner) workBatch(runCtx context.Context, gen int64, batch echoqueue.Ba
 	case <-runCtx.Done():
 		// The outcome was computed but the grace window closed before the
 		// hand-off; leave the batch to Recover.
+	case <-quit:
+		// A retiring handler never blocks Resize indefinitely: the batch
+		// stays under Pending/Recover control.
 	case r.outcomes <- item:
 		// Handed off; the settler releases the permit and slot.
 		released = true
