@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	echoqueue "echoqueue"
+	echoqueue "github.com/cccccccccooool/EchoQueue"
 	"github.com/redis/go-redis/v9"
 )
 

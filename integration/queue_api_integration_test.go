@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	echoqueue "example.com/m"
-	"example.com/m/internal/testutil"
+	echoqueue "github.com/cccccccccooool/EchoQueue"
+	"github.com/cccccccccooool/EchoQueue/internal/testutil"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -173,6 +173,58 @@ func TestSettleDuplicateConflictAndResultIdentity(t *testing.T) {
 	}
 }
 
+func TestSettleRetryAndDeadEffectsCarryStableIdentity(t *testing.T) {
+	f := newFixture(t, 1, time.Second)
+	ctx := context.Background()
+	seedTask(t, f, "task-retry")
+	seedTask(t, f, "task-dead")
+	batch, err := f.queue.Dispatch(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	receipt, err := f.scheduler.Settle(ctx, batch.ID, echoqueue.Outcome{
+		RequestID: "request-effects",
+		Failures: []echoqueue.Failure{
+			{TaskID: "task-retry", Reason: "temporary", Retryable: true},
+			{TaskID: "task-dead", Reason: "permanent", Retryable: false},
+		},
+	})
+	if err != nil || receipt.Status != echoqueue.ReceiptApplied {
+		t.Fatalf("Settle = %+v, err=%v", receipt, err)
+	}
+	if receipt.RetryCount != 1 || receipt.DeadCount != 1 {
+		t.Fatalf("receipt effect counts = %+v", receipt)
+	}
+
+	retryRaw, err := f.rdb.LRange(ctx, f.source, 0, -1).Result()
+	if err != nil || len(retryRaw) != 1 {
+		t.Fatalf("retry source = %#v, err=%v", retryRaw, err)
+	}
+	var retry echoqueue.Task
+	if err := json.Unmarshal([]byte(retryRaw[0]), &retry); err != nil {
+		t.Fatalf("decode retry task: %v", err)
+	}
+	if retry.TaskID != "task-retry" || retry.RetryCount != 1 {
+		t.Fatalf("retry task = %+v", retry)
+	}
+
+	deadRaw, err := f.rdb.LRange(ctx, f.dead, 0, -1).Result()
+	if err != nil || len(deadRaw) != 1 {
+		t.Fatalf("dead records = %#v, err=%v", deadRaw, err)
+	}
+	var dead map[string]interface{}
+	if err := json.Unmarshal([]byte(deadRaw[0]), &dead); err != nil {
+		t.Fatalf("decode dead record: %v", err)
+	}
+	if dead["task_id"] != "task-dead" || dead["effect_id"] == nil || dead["batch_id"] != batch.ID {
+		t.Fatalf("dead record identity = %#v", dead)
+	}
+	if pendingErr := f.rdb.Get(ctx, pendingKey(f.namespace, batch.ID)).Err(); !errors.Is(pendingErr, redis.Nil) {
+		t.Fatalf("pending after settle = %v", pendingErr)
+	}
+}
+
 func TestWrongTypeNeverDeletesPending(t *testing.T) {
 	f := newFixture(t, 0, time.Second)
 	seedTask(t, f, "task-wrong-type")
@@ -228,6 +280,43 @@ func TestMaxRetryZeroRecoverWritesDeadAndLateSettleIsStale(t *testing.T) {
 	}
 	if got, err := f.rdb.LLen(context.Background(), f.dead).Result(); err != nil || got != 1 {
 		t.Fatalf("dead length = %d, err=%v", got, err)
+	}
+}
+
+func TestRecoverWithMaxRetryRequeuesStableTask(t *testing.T) {
+	f := newFixture(t, 1, 10*time.Millisecond)
+	ctx := context.Background()
+	seedTask(t, f, "task-recover-retry")
+	batch, err := f.queue.Dispatch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	runErr := runUntilReceipt(t, f, batch.ID)
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run = %v", runErr)
+	}
+
+	retryRaw, err := f.rdb.LRange(ctx, f.source, 0, -1).Result()
+	if err != nil || len(retryRaw) != 1 {
+		t.Fatalf("recovered retry source = %#v, err=%v", retryRaw, err)
+	}
+	var retry echoqueue.Task
+	if err := json.Unmarshal([]byte(retryRaw[0]), &retry); err != nil {
+		t.Fatalf("decode recovered retry task: %v", err)
+	}
+	if retry.TaskID != "task-recover-retry" || retry.RetryCount != 1 {
+		t.Fatalf("recovered retry task = %+v", retry)
+	}
+	if deadCount, err := f.rdb.LLen(ctx, f.dead).Result(); err != nil || deadCount != 0 {
+		t.Fatalf("dead count after retry recovery = %d, err=%v", deadCount, err)
+	}
+	if pendingErr := f.rdb.Get(ctx, pendingKey(f.namespace, batch.ID)).Err(); !errors.Is(pendingErr, redis.Nil) {
+		t.Fatalf("pending after recovery = %v", pendingErr)
+	}
+	if _, deadlineErr := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batch.ID).Result(); !errors.Is(deadlineErr, redis.Nil) {
+		t.Fatalf("deadline after recovery = %v", deadlineErr)
 	}
 }
 

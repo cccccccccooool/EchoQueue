@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"example.com/m/internal/testutil"
+	"github.com/cccccccccooool/EchoQueue/internal/testutil"
 )
 
 func runUntilState(t *testing.T, f fixture, condition func() bool) error {

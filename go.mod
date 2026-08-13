@@ -1,5 +1,4 @@
-// TODO(private-release): replace the placeholder with the actual private module path.
-module example.com/m
+module github.com/cccccccccooool/EchoQueue
 
 go 1.25.5
 

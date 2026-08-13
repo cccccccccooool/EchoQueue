@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	echoqueue "echoqueue"
+	echoqueue "github.com/cccccccccooool/EchoQueue"
 )
 
 // errPoolAlreadyActive mirrors Scheduler's ErrRunAlreadyActive: a pool may

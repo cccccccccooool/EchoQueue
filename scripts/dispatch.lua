@@ -21,6 +21,19 @@ local maxPayloadBytes = tonumber(ARGV[5])
 local maxBatchBytes = tonumber(ARGV[6])
 local maxTasks = tonumber(ARGV[7])
 
+local function validTaskID(value)
+    if type(value) ~= 'string' or value == '' or string.match(value, '^%s*$') then
+        return false
+    end
+    for i = 1, #value do
+        local byte = string.byte(value, i)
+        if byte == 0 or byte < 32 or byte == 127 then
+            return false
+        end
+    end
+    return true
+end
+
 if not batchSize or batchSize < 1 or batchSize > maxTasks then
     return {"invalid", "batch size is invalid"}
 end
@@ -62,6 +75,9 @@ for i, raw in ipairs(rawItems) do
         if task.payload == nil then
             return {"invalid", "task payload is missing"}
         end
+        if not validTaskID(task.task_id) then
+            return {"invalid", "task id is invalid"}
+        end
     else
         local payload = raw
         if ok then payload = parsed end
@@ -71,7 +87,8 @@ for i, raw in ipairs(rawItems) do
             payload = payload
         }
     end
-    if tonumber(task.retry_count) == nil or tonumber(task.retry_count) < 0 then
+    local retryCount = tonumber(task.retry_count)
+    if retryCount == nil or retryCount < 0 or retryCount % 1 ~= 0 then
         return {"invalid", "task retry_count is invalid"}
     end
     if seen[task.task_id] then
@@ -84,7 +101,7 @@ for i, raw in ipairs(rawItems) do
     end
     local encoded = cjson.encode({
         task_id = task.task_id,
-        retry_count = tonumber(task.retry_count),
+        retry_count = retryCount,
         payload = task.payload
     })
     totalBytes = totalBytes + #encoded

@@ -137,12 +137,6 @@ end
 if not checkList(deadKey, #dead) then
   return {'invalid', 'invalid dead key type'}
 end
-for _, item in ipairs(retries) do
-  if item.batch_id ~= batchID then
-    return {'invalid', 'invalid retry batch'}
-  end
-end
-
 local receiptType = redis.call('TYPE', receiptKey)['ok']
 if not invalidReceiptType(receiptType) then
   return {'invalid', 'invalid receipt key type'}
@@ -187,7 +181,7 @@ local okPending, pending = pcall(cjson.decode, pendingRaw)
 if not okPending or type(pending) ~= 'table' then
   return {'invalid', 'invalid pending json'}
 end
-if pending.schema_version ~= 1 or pending.protocol_version ~= 1 or pending.batch_id ~= batchID then
+if pending.schema_version ~= 1 or pending.protocol_version ~= 1 or pending.state ~= 'PENDING' or pending.batch_id ~= batchID then
   return {'invalid', 'invalid pending schema'}
 end
 if type(pending.deadline_at) ~= 'number' or pending.deadline_at <= 0 or pending.deadline_at % 1 ~= 0 then

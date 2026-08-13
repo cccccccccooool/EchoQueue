@@ -7,11 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"example.com/m/internal/testutil"
+	"github.com/cccccccccooool/EchoQueue/internal/testutil"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -39,6 +40,28 @@ func TestReceiptBaseValidationPrecedesEffects(t *testing.T) {
 		assertR0NoTerminalWrites(t, f, batch.ID)
 	})
 
+	t.Run("settle fractional ttl", func(t *testing.T) {
+		f := newFixture(t, 0, time.Second)
+		ctx := context.Background()
+		seedTask(t, f, "r0-settle-fractional-ttl")
+		batch, err := f.queue.Dispatch(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value, err := f.rdb.Eval(ctx, integrationLua(t, "settle.lua"), []string{
+			pendingKey(f.namespace, batch.ID),
+			receiptKey(f.namespace, batch.ID),
+			deadlineKey(f.namespace),
+			f.result,
+			f.source,
+			f.dead,
+		}, batch.ID, "r0-settle-fractional-request", "r0-settle-fractional-hash", "{}", "[]", "[]", "[]", "1.5").Result()
+		if err != nil || scriptStatus(value) != "invalid" {
+			t.Fatalf("settle fractional ttl response = %v, err=%v", value, err)
+		}
+		assertR0NoTerminalWrites(t, f, batch.ID)
+	})
+
 	t.Run("recover", func(t *testing.T) {
 		f := newFixture(t, 0, time.Millisecond)
 		ctx := context.Background()
@@ -60,6 +83,59 @@ func TestReceiptBaseValidationPrecedesEffects(t *testing.T) {
 		}
 		assertR0NoTerminalWrites(t, f, batch.ID)
 	})
+}
+
+func TestSettleDoesNotTreatFractionalReceiptAsTerminal(t *testing.T) {
+	f := newFixture(t, 0, time.Second)
+	ctx := context.Background()
+	seedTask(t, f, "fractional-receipt-task")
+	batch, err := f.queue.Dispatch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingBefore, err := f.rdb.Get(ctx, pendingKey(f.namespace, batch.ID)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadlineBefore, err := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batch.ID).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptRaw, err := json.Marshal(map[string]interface{}{
+		"schema_version":   1,
+		"protocol_version": 1,
+		"batch_id":         batch.ID,
+		"request_id":       "fractional-receipt-request",
+		"command_hash":     "fractional-receipt-hash",
+		"winner":           "settle",
+		"closed_at":        1.5,
+		"result_count":     1,
+		"retry_count":      0,
+		"dead_count":       0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.rdb.Set(ctx, receiptKey(f.namespace, batch.ID), receiptRaw, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, settleErr := f.scheduler.Settle(ctx, batch.ID, Outcome{
+		RequestID: "fractional-receipt-request",
+		Results:   []Result{{TaskID: "fractional-receipt-task", Data: json.RawMessage(`{"ok":true}`)}},
+	})
+	if settleErr == nil {
+		t.Fatal("fractional receipt was accepted as terminal")
+	}
+	if got, getErr := f.rdb.Get(ctx, pendingKey(f.namespace, batch.ID)).Result(); getErr != nil || got != pendingBefore {
+		t.Fatalf("pending changed after fractional receipt: %q, err=%v", got, getErr)
+	}
+	if got, scoreErr := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batch.ID).Result(); scoreErr != nil || got != deadlineBefore {
+		t.Fatalf("deadline changed after fractional receipt: %v, before=%v, err=%v", got, deadlineBefore, scoreErr)
+	}
+	if got, lengthErr := f.rdb.LLen(ctx, f.result).Result(); lengthErr != nil || got != 0 {
+		t.Fatalf("result effects after fractional receipt: %d, err=%v", got, lengthErr)
+	}
 }
 
 func assertR0NoTerminalWrites(t *testing.T, f fixture, batchID string) {
@@ -573,6 +649,222 @@ func TestSettleAndRecoverHaveOneFirstWinner(t *testing.T) {
 	}
 	if _, err := f.rdb.Get(context.Background(), pendingKey(f.namespace, batch.ID)).Result(); !errors.Is(err, redis.Nil) {
 		t.Fatalf("pending remains after first winner: %v", err)
+	}
+}
+
+func TestWhiteBoxPrivateRecoveryDataFlow(t *testing.T) {
+	t.Run("not due repairs no state", func(t *testing.T) {
+		f := newFixture(t, 0, time.Hour)
+		ctx := context.Background()
+		seedTask(t, f, "whitebox-not-due")
+		batch, err := f.queue.Dispatch(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pendingBefore, err := f.rdb.Get(ctx, pendingKey(f.namespace, batch.ID)).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		receipt, err := f.scheduler.recoverBatch(ctx, batch.ID)
+		if err != nil || receipt.Status != ReceiptNotDue {
+			t.Fatalf("recoverBatch not_due = %+v, err=%v", receipt, err)
+		}
+		if got, getErr := f.rdb.Get(ctx, pendingKey(f.namespace, batch.ID)).Result(); getErr != nil || got != pendingBefore {
+			t.Fatalf("pending changed on not_due: %q, err=%v", got, getErr)
+		}
+		if _, scoreErr := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batch.ID).Result(); scoreErr != nil {
+			t.Fatalf("deadline missing on not_due: %v", scoreErr)
+		}
+	})
+
+	t.Run("expired retry and duplicate receipt", func(t *testing.T) {
+		f := newFixture(t, 1, time.Millisecond)
+		ctx := context.Background()
+		seedTask(t, f, "whitebox-retry")
+		batch, err := f.queue.Dispatch(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(25 * time.Millisecond)
+
+		first, err := f.scheduler.recoverBatch(ctx, batch.ID)
+		if err != nil || first.Status != ReceiptApplied || first.RetryCount != 1 {
+			t.Fatalf("first recover = %+v, err=%v", first, err)
+		}
+		retryRaw, err := f.rdb.LRange(ctx, f.source, 0, -1).Result()
+		if err != nil || len(retryRaw) != 1 {
+			t.Fatalf("recovery retry source = %#v, err=%v", retryRaw, err)
+		}
+		var retry Task
+		if err := json.Unmarshal([]byte(retryRaw[0]), &retry); err != nil {
+			t.Fatal(err)
+		}
+		if retry.TaskID != "whitebox-retry" || retry.RetryCount != 1 {
+			t.Fatalf("recovery retry task = %+v", retry)
+		}
+
+		second, err := f.scheduler.recoverBatch(ctx, batch.ID)
+		if err != nil || second.Status != ReceiptDuplicate || second.RequestID != first.RequestID {
+			t.Fatalf("duplicate recover = %+v, err=%v", second, err)
+		}
+		if got, err := f.rdb.LLen(ctx, f.source).Result(); err != nil || got != 1 {
+			t.Fatalf("duplicate recovery added effects: %d, err=%v", got, err)
+		}
+	})
+
+	t.Run("orphan clears deadline", func(t *testing.T) {
+		f := newFixture(t, 0, time.Second)
+		ctx := context.Background()
+		batchID := "whitebox-orphan"
+		if err := f.rdb.ZAdd(ctx, deadlineKey(f.namespace), redis.Z{Score: 1, Member: batchID}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		receipt, err := f.scheduler.recoverBatch(ctx, batchID)
+		if err != nil || receipt.Status != ReceiptNotFound {
+			t.Fatalf("orphan recover = %+v, err=%v", receipt, err)
+		}
+		if _, scoreErr := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batchID).Result(); !errors.Is(scoreErr, redis.Nil) {
+			t.Fatalf("orphan deadline remains: %v", scoreErr)
+		}
+	})
+
+	t.Run("defer preserves pending and rotates index", func(t *testing.T) {
+		f := newFixture(t, 0, time.Second)
+		ctx := context.Background()
+		seedTask(t, f, "whitebox-defer")
+		batch, err := f.queue.Dispatch(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pendingBefore, err := f.rdb.Get(ctx, pendingKey(f.namespace, batch.ID)).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batch.ID).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		status, err := f.scheduler.deferRecover(ctx, batch.ID)
+		if err != nil || status != "deferred" {
+			t.Fatalf("defer = %q, err=%v", status, err)
+		}
+		after, err := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batch.ID).Result()
+		if err != nil || after <= before {
+			t.Fatalf("defer deadline = %v, before=%v, err=%v", after, before, err)
+		}
+		if got, getErr := f.rdb.Get(ctx, pendingKey(f.namespace, batch.ID)).Result(); getErr != nil || got != pendingBefore {
+			t.Fatalf("pending changed by defer: %q, err=%v", got, getErr)
+		}
+	})
+}
+
+func TestWhiteBoxRecoverExpiredContinuesAfterCorruptPending(t *testing.T) {
+	f := newFixture(t, 0, time.Millisecond)
+	ctx := context.Background()
+	seedTask(t, f, "whitebox-corrupt")
+	corrupt, err := f.queue.Dispatch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedTask(t, f, "whitebox-normal")
+	normal, err := f.queue.Dispatch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.rdb.Set(ctx, pendingKey(f.namespace, corrupt.ID), "{whitebox-corrupt", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := f.rdb.ZScore(ctx, deadlineKey(f.namespace), corrupt.ID).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(25 * time.Millisecond)
+
+	runErr := f.scheduler.recoverExpired(ctx)
+	if runErr == nil || !strings.Contains(runErr.Error(), corrupt.ID) {
+		t.Fatalf("recoverExpired error = %v, want corrupt batch %s", runErr, corrupt.ID)
+	}
+	if _, err := f.rdb.Get(ctx, receiptKey(f.namespace, normal.ID)).Result(); err != nil {
+		t.Fatalf("normal batch did not recover after corrupt candidate: %v", err)
+	}
+	if got, err := f.rdb.Get(ctx, pendingKey(f.namespace, corrupt.ID)).Result(); err != nil || got != "{whitebox-corrupt" {
+		t.Fatalf("corrupt pending changed: %q, err=%v", got, err)
+	}
+	after, err := f.rdb.ZScore(ctx, deadlineKey(f.namespace), corrupt.ID).Result()
+	if err != nil || after <= before {
+		t.Fatalf("corrupt deadline was not deferred: after=%v before=%v err=%v", after, before, err)
+	}
+}
+
+func TestRecoverLuaRejectsClosedPendingBeforeEffects(t *testing.T) {
+	f := newFixture(t, 0, time.Millisecond)
+	ctx := context.Background()
+	seedTask(t, f, "whitebox-closed")
+	batch, err := f.queue.Dispatch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingKeyValue := pendingKey(f.namespace, batch.ID)
+	pendingRaw, err := f.rdb.Get(ctx, pendingKeyValue).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pending map[string]interface{}
+	if err := json.Unmarshal([]byte(pendingRaw), &pending); err != nil {
+		t.Fatal(err)
+	}
+	pending["state"] = "CLOSED"
+	pending["deadline_at"] = int64(1)
+	closedRaw, err := json.Marshal(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.rdb.Set(ctx, pendingKeyValue, closedRaw, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	deadRaw, err := json.Marshal([]deadRecord{{
+		SchemaVersion: protocolVersion,
+		Protocol:      protocolVersion,
+		EffectID:      "whitebox-closed-effect",
+		TaskID:        "whitebox-closed",
+		BatchID:       batch.ID,
+		RetryCount:    0,
+		Payload:       json.RawMessage(`{"input":true}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptRaw, err := json.Marshal(storedReceipt{
+		SchemaVersion: protocolVersion,
+		Protocol:      protocolVersion,
+		BatchID:       batch.ID,
+		RequestID:     "recover:" + batch.ID,
+		CommandHash:   recoverCommandHash(batch.ID),
+		Winner:        "recover",
+		DeadCount:     1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := f.rdb.Eval(ctx, recoverScript, []string{
+		pendingKeyValue,
+		receiptKey(f.namespace, batch.ID),
+		deadlineKey(f.namespace),
+		f.source,
+		f.dead,
+	}, batch.ID, "recover:"+batch.ID, recoverCommandHash(batch.ID), string(receiptRaw), "[]", string(deadRaw), int64(time.Hour/time.Millisecond)).Result()
+	if err != nil || scriptStatus(value) != "invalid" {
+		t.Fatalf("closed pending recover = %v, err=%v", value, err)
+	}
+	if got, getErr := f.rdb.Get(ctx, pendingKeyValue).Result(); getErr != nil || got != string(closedRaw) {
+		t.Fatalf("closed pending changed: %q, err=%v", got, getErr)
+	}
+	if got, err := f.rdb.LLen(ctx, f.dead).Result(); err != nil || got != 0 {
+		t.Fatalf("closed pending produced dead effect: %d, err=%v", got, err)
+	}
+	if _, err := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batch.ID).Result(); err != nil {
+		t.Fatalf("closed pending deadline disappeared: %v", err)
 	}
 }
 

@@ -25,7 +25,7 @@ local requestID = ARGV[2]
 local commandHash = ARGV[3]
 local receiptTTL = tonumber(ARGV[8])
 
-if not receiptTTL or receiptTTL < 1 then
+if not receiptTTL or receiptTTL < 1 or receiptTTL % 1 ~= 0 then
     return {"invalid", "receipt ttl is invalid"}
 end
 
@@ -59,7 +59,7 @@ local function validateReceipt(raw, expectedBatchID, expectedRequestID, expected
     elseif receipt.winner ~= 'settle' and receipt.winner ~= 'recover' then
         return nil, "receipt winner is invalid"
     end
-    if type(receipt.closed_at) ~= 'number' or (requireClosed and receipt.closed_at <= 0) or (not requireClosed and receipt.closed_at < 0) then
+    if type(receipt.closed_at) ~= 'number' or receipt.closed_at % 1 ~= 0 or (requireClosed and receipt.closed_at <= 0) or (not requireClosed and receipt.closed_at < 0) then
         return nil, "receipt closed_at is invalid"
     end
     for _, field in ipairs({"result_count", "retry_count", "dead_count"}) do

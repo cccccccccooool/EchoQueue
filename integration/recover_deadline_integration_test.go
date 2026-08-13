@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	echoqueue "example.com/m"
+	echoqueue "github.com/cccccccccooool/EchoQueue"
 	"github.com/redis/go-redis/v9"
 )
 

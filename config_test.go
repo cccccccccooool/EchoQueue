@@ -202,6 +202,167 @@ func TestDispatchContextCancellationFailsBeforeRedisWrite(t *testing.T) {
 	}
 }
 
+func TestConfigNormalizationBoundaries(t *testing.T) {
+	badUTF8 := string([]byte{0xff, 0xfe})
+	tests := []struct {
+		name   string
+		config Config
+		want   func(Config) bool
+	}{
+		{name: "all zero uses defaults", config: Config{Namespace: "all-zero"},
+			want: func(c Config) bool {
+				return c.MaxRetry == 3 && c.MaxRetrySet && c.VisibilityTimeout == 30*time.Second && c.ReceiptTTL == 24*time.Hour && c.MaxBatchSize == 1000 && c.MaxPayloadBytes == 1<<20 && c.MaxBatchBytes == 64<<20 && c.RunInterval == 500*time.Millisecond && c.RunBatchSize == 32
+			}},
+		{name: "unset max retry uses default", config: Config{Namespace: "unset-retry"},
+			want: func(c Config) bool { return c.MaxRetry == 3 }},
+		{name: "explicit zero max retry stays zero", config: Config{Namespace: "zero-retry", MaxRetrySet: true, MaxRetry: 0},
+			want: func(c Config) bool { return c.MaxRetry == 0 && c.MaxRetrySet }},
+		{name: "one millisecond visibility", config: Config{Namespace: "vis-1ms", VisibilityTimeout: time.Millisecond},
+			want: func(c Config) bool { return c.VisibilityTimeout == time.Millisecond }},
+		{name: "one millisecond receipt ttl", config: Config{Namespace: "ttl-1ms", ReceiptTTL: time.Millisecond},
+			want: func(c Config) bool { return c.ReceiptTTL == time.Millisecond }},
+		{name: "payload below batch bytes", config: Config{Namespace: "payload", MaxPayloadBytes: 1000, MaxBatchBytes: 2000},
+			want: func(c Config) bool { return c.MaxPayloadBytes == 1000 && c.MaxBatchBytes == 2000 }},
+		{name: "explicit batch limits", config: Config{Namespace: "limits", MaxBatchSize: 10, MaxPayloadBytes: 500, MaxBatchBytes: 900, RunBatchSize: 7, RunInterval: 250 * time.Millisecond},
+			want: func(c Config) bool {
+				return c.MaxBatchSize == 10 && c.MaxPayloadBytes == 500 && c.MaxBatchBytes == 900 && c.RunBatchSize == 7 && c.RunInterval == 250*time.Millisecond
+			}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheduler, err := New(testClient(), tc.config)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if !tc.want(scheduler.config) {
+				t.Fatalf("normalized config = %+v", scheduler.config)
+			}
+		})
+	}
+	rejected := []struct {
+		name   string
+		config Config
+	}{
+		{name: "negative max retry", config: Config{Namespace: "neg-retry", MaxRetry: -1}},
+		{name: "visibility below one millisecond", config: Config{Namespace: "vis-subms", VisibilityTimeout: time.Microsecond}},
+		{name: "negative visibility", config: Config{Namespace: "vis-neg", VisibilityTimeout: -time.Second}},
+		{name: "receipt ttl below one millisecond", config: Config{Namespace: "ttl-subms", ReceiptTTL: 999 * time.Microsecond}},
+		{name: "negative receipt ttl", config: Config{Namespace: "ttl-neg", ReceiptTTL: -time.Second}},
+		{name: "negative max batch size", config: Config{Namespace: "neg-batch", MaxBatchSize: -1}},
+		{name: "negative payload bytes", config: Config{Namespace: "neg-payload", MaxPayloadBytes: -1}},
+		{name: "negative batch bytes", config: Config{Namespace: "neg-batch-bytes", MaxBatchBytes: -1}},
+		{name: "batch bytes below payload bytes", config: Config{Namespace: "crossed", MaxPayloadBytes: 2048, MaxBatchBytes: 1024}},
+		{name: "negative run batch size", config: Config{Namespace: "neg-run-batch", RunBatchSize: -2}},
+		{name: "negative run interval", config: Config{Namespace: "neg-run-interval", RunInterval: -time.Second}},
+		{name: "empty namespace", config: Config{Namespace: ""}},
+		{name: "blank namespace", config: Config{Namespace: "   "}},
+		{name: "control character namespace", config: Config{Namespace: "ns\x01"}},
+		{name: "nul namespace", config: Config{Namespace: "ns\x00ns"}},
+		{name: "invalid utf8 namespace", config: Config{Namespace: badUTF8}},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := New(testClient(), tc.config); err == nil {
+				t.Fatal("invalid config was accepted")
+			}
+		})
+	}
+}
+
+func TestQueueConfigTextValidation(t *testing.T) {
+	badUTF8 := string([]byte{0xff, 0xfe})
+	tests := []struct {
+		name   string
+		config QueueConfig
+	}{
+		{name: "empty task name", config: QueueConfig{TaskName: "", Source: "src"}},
+		{name: "blank task name", config: QueueConfig{TaskName: "  ", Source: "src"}},
+		{name: "control task name", config: QueueConfig{TaskName: "task\x02", Source: "src"}},
+		{name: "nul task name", config: QueueConfig{TaskName: "task\x00x", Source: "src"}},
+		{name: "invalid utf8 task name", config: QueueConfig{TaskName: badUTF8, Source: "src"}},
+		{name: "empty source", config: QueueConfig{TaskName: "task", Source: ""}},
+		{name: "blank source", config: QueueConfig{TaskName: "task", Source: " "}},
+		{name: "control source", config: QueueConfig{TaskName: "task", Source: "src\x1f"}},
+		{name: "nul source", config: QueueConfig{TaskName: "task", Source: "src\x00"}},
+		{name: "invalid utf8 source", config: QueueConfig{TaskName: "task", Source: badUTF8}},
+		{name: "control result", config: QueueConfig{TaskName: "task", Source: "src", Result: "res\x07"}},
+		{name: "invalid utf8 result", config: QueueConfig{TaskName: "task", Source: "src", Result: badUTF8}},
+		{name: "control dead", config: QueueConfig{TaskName: "task", Source: "src", Dead: "dead\x08"}},
+		{name: "invalid utf8 dead", config: QueueConfig{TaskName: "task", Source: "src", Dead: badUTF8}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.config.normalized(); err == nil {
+				t.Fatal("invalid queue config was accepted")
+			}
+		})
+	}
+	valid := []struct {
+		name   string
+		config QueueConfig
+	}{
+		{name: "minimal", config: QueueConfig{TaskName: "task", Source: "src"}},
+		{name: "unicode keys", config: QueueConfig{TaskName: "发票任务", Source: "发票:来源", Result: "发票:结果", Dead: "发票:死信"}},
+		{name: "cjk and emoji", config: QueueConfig{TaskName: "task-队列", Source: "source-队列-🚀", Result: "", Dead: ""}},
+		{name: "empty result and dead", config: QueueConfig{TaskName: "task", Source: "src", Result: "", Dead: ""}},
+		{name: "non empty result and dead", config: QueueConfig{TaskName: "task", Source: "src", Result: "res", Dead: "dead"}},
+	}
+	for _, tc := range valid {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.config.normalized(); err != nil {
+				t.Fatalf("valid queue config rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestQueueConfigRouteConflicts(t *testing.T) {
+	rejected := []struct {
+		name   string
+		config QueueConfig
+	}{
+		{name: "result equals source", config: QueueConfig{TaskName: "task", Source: "same", Result: "same"}},
+		{name: "dead equals source", config: QueueConfig{TaskName: "task", Source: "same", Dead: "same"}},
+		{name: "result equals dead", config: QueueConfig{TaskName: "task", Source: "src", Result: "both", Dead: "both"}},
+		{name: "result equals dead with distinct source", config: QueueConfig{TaskName: "task", Source: "both", Result: "other", Dead: "other"}},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.config.normalized(); err == nil {
+				t.Fatal("conflicting routes were accepted")
+			}
+		})
+	}
+	if _, err := (QueueConfig{TaskName: "task", Source: "src", Result: "res", Dead: "dead"}).normalized(); err != nil {
+		t.Fatalf("distinct routes rejected: %v", err)
+	}
+	if _, err := (QueueConfig{TaskName: "task", Source: "src", Result: "res"}).normalized(); err != nil {
+		t.Fatalf("distinct routes with empty dead rejected: %v", err)
+	}
+}
+
+func TestValidateTextRejectsControlAndInvalidUTF8(t *testing.T) {
+	badUTF8 := string([]byte{0xc3, 0x28})
+	rejected := []string{"\x00", "\x01", "\x1f", "\x7f", badUTF8}
+	for _, value := range rejected {
+		if err := validateText("field", value, false); err == nil {
+			t.Fatalf("text %q was accepted", value)
+		}
+	}
+	accepted := []string{"", "normal", "中文", "emoji-🚀"}
+	for _, value := range accepted {
+		if err := validateText("field", value, false); err != nil {
+			t.Fatalf("text %q rejected: %v", value, err)
+		}
+	}
+	if err := validateText("field", "", true); err == nil {
+		t.Fatal("empty required text was accepted")
+	}
+	if err := validateText("field", "  ", true); err == nil {
+		t.Fatal("blank required text was accepted")
+	}
+}
+
 func TestRedisCapabilityCheckIsCachedAndRetryable(t *testing.T) {
 	scheduler, err := New(testClient(), Config{Namespace: "redis-cache"})
 	if err != nil {

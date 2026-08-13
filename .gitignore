@@ -1,0 +1,4 @@
+.gocache
+.gocache-amd64
+testdata/
+docs/
