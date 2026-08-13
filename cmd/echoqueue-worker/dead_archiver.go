@@ -29,6 +29,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// ErrorSink receives host-visible errors from the archiver. The reference
+// logs them; a production host would alert.
+type ErrorSink func(err error)
+
 // errArchiverAlreadyActive mirrors Scheduler's ErrRunAlreadyActive: an
 // archiver may only have one active Run call.
 var errArchiverAlreadyActive = errors.New("echoqueue worker: dead archiver is already running")

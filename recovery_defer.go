@@ -6,10 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 //go:embed scripts/defer_recover.lua
-var deferRecoverScript string
+var deferRecoverScriptSource string
+
+// deferRecoverScript runs the embedded script through EVALSHA with an
+// automatic EVAL fallback.
+var deferRecoverScript = redis.NewScript(deferRecoverScriptSource)
 
 var errDeferRecover = errors.New("echoqueue: defer recover failed")
 
@@ -24,7 +30,7 @@ func (s *Scheduler) deferRecover(ctx context.Context, batchID string) (string, e
 		return "", fmt.Errorf("%w: %v", errDeferRecover, err)
 	}
 	if err := s.ensureRedis(ctx); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %w: redis probe: %v", errDeferRecover, ErrTransientRedis, err)
 	}
 
 	delay := s.config.RunInterval
@@ -35,13 +41,13 @@ func (s *Scheduler) deferRecover(ctx context.Context, batchID string) (string, e
 	if delayMillis < 1 {
 		delayMillis = 1
 	}
-	value, err := s.rdb.Eval(ctx, deferRecoverScript, []string{
+	value, err := deferRecoverScript.Eval(ctx, s.rdb, []string{
 		s.keys.pending(batchID),
 		s.keys.receipt(batchID),
 		s.keys.deadline(),
 	}, batchID, delayMillis).Result()
 	if err != nil {
-		return "", fmt.Errorf("%w: Redis script: %v", errDeferRecover, err)
+		return "", fmt.Errorf("%w: %w: Redis script: %v", errDeferRecover, ErrTransientRedis, err)
 	}
 	parts, ok := value.([]interface{})
 	if !ok || len(parts) == 0 {

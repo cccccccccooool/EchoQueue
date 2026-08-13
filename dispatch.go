@@ -8,10 +8,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 //go:embed scripts/dispatch.lua
-var dispatchScript string
+var dispatchScriptSource string
+
+// dispatchScript runs the embedded script through EVALSHA with an automatic
+// EVAL fallback, so the hot path never resends the script body.
+var dispatchScript = redis.NewScript(dispatchScriptSource)
 
 type dispatchBase struct {
 	SchemaVersion int         `json:"schema_version"`
@@ -52,7 +57,7 @@ func (q *Queue) Dispatch(ctx context.Context, batchSize int) (Batch, error) {
 	}
 	pendingKey := q.scheduler.keys.pending(batchID)
 	deadlineKey := q.scheduler.keys.deadline()
-	value, err := q.scheduler.rdb.Eval(ctx, dispatchScript, []string{q.config.Source, pendingKey, deadlineKey},
+	value, err := dispatchScript.Eval(ctx, q.scheduler.rdb, []string{q.config.Source, pendingKey, deadlineKey},
 		batchSize, batchID, string(base), q.settings.VisibilityTimeout.Milliseconds(), q.settings.MaxPayloadBytes, q.settings.MaxBatchBytes, q.settings.MaxBatchSize).Result()
 	if err != nil {
 		return Batch{}, fmt.Errorf("echoqueue: dispatch: %w", err)

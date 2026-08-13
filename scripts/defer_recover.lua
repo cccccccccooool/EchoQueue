@@ -63,7 +63,9 @@ local function deferPending()
     base = tonumber(current)
   end
   local deferAt = base + errorDelayMillis
-  redis.call('ZADD', deadlineKey, deferAt, batchID)
+  -- GT (Redis 6.2+) is a defensive fence: even if a future change computes a
+  -- smaller or equal score, the deadline can never move backwards or stall.
+  redis.call('ZADD', deadlineKey, 'GT', deferAt, batchID)
   return {'deferred', tostring(deferAt)}
 end
 

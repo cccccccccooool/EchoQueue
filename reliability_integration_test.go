@@ -884,7 +884,7 @@ func TestRecoverLuaRejectsClosedPendingBeforeEffects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	value, err := f.rdb.Eval(ctx, recoverScript, []string{
+	value, err := f.rdb.Eval(ctx, recoverScriptSource, []string{
 		pendingKeyValue,
 		receiptKey(f.namespace, batch.ID),
 		deadlineKey(f.namespace),
@@ -983,13 +983,13 @@ func integrationLua(t *testing.T, name string) string {
 	t.Helper()
 	switch name {
 	case "defer_recover.lua":
-		return deferRecoverScript
+		return deferRecoverScriptSource
 	case "dispatch.lua":
-		return dispatchScript
+		return dispatchScriptSource
 	case "recover.lua":
-		return recoverScript
+		return recoverScriptSource
 	case "settle.lua":
-		return settleScript
+		return settleScriptSource
 	default:
 		t.Fatalf("unknown embedded Lua %s", name)
 		return ""

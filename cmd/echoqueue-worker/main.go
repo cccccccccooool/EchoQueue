@@ -1,7 +1,8 @@
 // Command echoqueue-worker is the runnable host reference for EchoQueue
-// bounded consumption and dead archiving. It wires the public EchoQueue API to
-// the bounded pool and the dead archiver, and demonstrates the required
-// ordering: acquire permit -> Dispatch -> Handle -> Settle -> release permit.
+// bounded consumption and dead archiving. It wires the public EchoQueue API
+// to the consumer pipeline and the dead archiver, and demonstrates the
+// required ordering: acquire permit -> Dispatch -> Handle -> Settle ->
+// release permit.
 //
 // It deliberately contains no concrete external storage: the DeadSink below
 // logs only and exists to show the host-local injection point. A production
@@ -26,11 +27,12 @@ import (
 	"time"
 
 	echoqueue "github.com/cccccccccooool/EchoQueue"
+	"github.com/cccccccccooool/EchoQueue/consumer"
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
-	poolDefaults := defaultPoolConfig()
+	runnerDefaults := consumer.DefaultConfig()
 	archiverDefaults := defaultArchiverConfig()
 	addr := flag.String("addr", envOr("ECHOQUEUE_REDIS_ADDR", "127.0.0.1:6379"), "Redis address")
 	namespace := flag.String("namespace", "echoqueue-worker", "EchoQueue namespace")
@@ -39,11 +41,16 @@ func main() {
 	result := flag.String("result", "echoqueue-worker:invoice:result", "Result list key")
 	dead := flag.String("dead", "echoqueue-worker:invoice:dead", "Dead list key")
 	processing := flag.String("processing", "echoqueue-worker:invoice:dead-processing", "DeadProcessing list key")
-	workers := flag.Int("workers", poolDefaults.Workers, "pool worker goroutines")
-	maxInFlight := flag.Int("max-in-flight", poolDefaults.MaxInFlight, "max dispatched-not-settled batches")
-	buffer := flag.Int("buffer", poolDefaults.Buffer, "pool buffer slots")
-	batchSize := flag.Int("batch-size", poolDefaults.BatchSize, "tasks per Dispatch call")
-	grace := flag.Duration("shutdown-grace", poolDefaults.ShutdownGrace, "grace for in-flight batches after cancellation")
+	dispatchers := flag.Int("dispatchers", runnerDefaults.Dispatchers, "parallel Dispatch goroutines")
+	workers := flag.Int("workers", runnerDefaults.Workers, "handler goroutines")
+	settlers := flag.Int("settlers", runnerDefaults.Settlers, "parallel Settle goroutines")
+	maxInFlight := flag.Int("max-in-flight", runnerDefaults.MaxInFlight, "max dispatched-not-settled batches")
+	batchSize := flag.Int("batch-size", runnerDefaults.BatchSize, "tasks per Dispatch call")
+	batchBuffer := flag.Int("batch-buffer", runnerDefaults.BatchBuffer, "buffered dispatched batches waiting for a handler")
+	outcomeBuffer := flag.Int("outcome-buffer", runnerDefaults.OutcomeBuffer, "buffered outcomes waiting for a settler")
+	pollInterval := flag.Duration("poll-interval", runnerDefaults.PollInterval, "pause after an empty Dispatch")
+	errorBackoff := flag.Duration("error-backoff", runnerDefaults.ErrorBackoff, "jittered pause after Dispatch/Settle errors")
+	grace := flag.Duration("shutdown-grace", runnerDefaults.ShutdownGrace, "grace for in-flight batches after cancellation")
 	archiveBatch := flag.Int("archive-batch", archiverDefaults.BatchSize, "max dead records per persist batch")
 	enableArchive := flag.Bool("enable-archive", false, "start the dead archiver; the reference logging sink does not persist, so records are claimed but never acknowledged")
 	flag.Parse()
@@ -87,20 +94,24 @@ func main() {
 	defer stopRun()
 	go runRecoveryLoop(runCtx, scheduler)
 
-	pool, err := NewPool(PoolConfig{
+	runner, err := consumer.New(consumer.Config{
+		Dispatchers:   *dispatchers,
 		Workers:       *workers,
+		Settlers:      *settlers,
 		MaxInFlight:   *maxInFlight,
-		Buffer:        *buffer,
 		BatchSize:     *batchSize,
-		PollInterval:  poolDefaults.PollInterval,
+		BatchBuffer:   *batchBuffer,
+		OutcomeBuffer: *outcomeBuffer,
+		PollInterval:  *pollInterval,
+		ErrorBackoff:  *errorBackoff,
 		ShutdownGrace: *grace,
 	})
 	if err != nil {
-		log.Fatalf("NewPool: %v", err)
+		log.Fatalf("consumer.New: %v", err)
 	}
-	poolErr := make(chan error, 1)
+	runnerErr := make(chan error, 1)
 	go func() {
-		poolErr <- pool.Run(ctx, queue, scheduler, referenceHandler, reportError)
+		runnerErr <- runner.Run(ctx, queue, scheduler, referenceHandler, reportError)
 	}()
 
 	var archiveErr <-chan error
@@ -131,18 +142,19 @@ func main() {
 		log.Printf("dead archiver disabled; dead records remain in %q until a production sink is wired in", *dead)
 	}
 
-	log.Printf("consuming %q with %d workers, %d in-flight, %d buffer", *source, *workers, *maxInFlight, *buffer)
+	log.Printf("consuming %q with %d dispatchers, %d workers, %d settlers, %d in-flight, %d batch buffer, %d outcome buffer",
+		*source, *dispatchers, *workers, *settlers, *maxInFlight, *batchBuffer, *outcomeBuffer)
 	select {
 	case <-ctx.Done():
-	case err := <-poolErr:
-		reportUnexpectedStop("worker pool", err)
-		poolErr = nil
+	case err := <-runnerErr:
+		reportUnexpectedStop("consumer runner", err)
+		runnerErr = nil
 	case err := <-archiveErr:
 		reportUnexpectedStop("dead archiver", err)
 		archiveErr = nil
 	}
 	stop()
-	waitForComponent("worker pool", poolErr, *grace+time.Second)
+	waitForComponent("consumer runner", runnerErr, *grace+time.Second)
 	waitForComponent("dead archiver", archiveErr, archiverDefaults.ClaimTimeout+archiverDefaults.ErrorBackoff+time.Second)
 	if *enableArchive {
 		log.Printf("shutting down; unacked dead records stay in %q", *processing)
