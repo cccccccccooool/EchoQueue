@@ -312,6 +312,29 @@ go test -race -tags=integration ./... -count=1
 
 独立验收补充（2026-08-09，Redis 8.8.0 本机容器）：`scripts/perf_harness` 在 150,000 逻辑任务（5 场景、2% 重试注入、batch 64）下唯一 Result 150,000、Dead 0、丢失率 0.0000%，8 并发消费吞吐约 18,359/s；20,000 任务延迟压测中 Dispatch P95 约 8.8ms、Settle P95 约 15.1ms。
 
+### Consumer 流水线并发矩阵
+
+`scripts/consumer_matrix` 针对 `consumer` 包的三阶段并发矩阵压测（每格唯一 namespace、零丢失校验、不执行 FLUSHDB）：
+
+```powershell
+go run ./scripts/consumer_matrix -tasks 30000 -batch-size 32
+```
+
+最近一次本机 Redis 6.2 基线（30,000 任务/格，batch 32，MaxInFlight 16，BatchBuffer/OutcomeBuffer 8）：
+
+| 配置 DxWxS | 吞吐 tasks/s | Dispatch p50/p99 | Settle p50/p99 |
+|---|---|---|---|
+| 1x1x1 | 5,836 | 2.78/4.63ms | 5.44/8.10ms |
+| 1x2x1 | 6,024 | 2.76/4.49ms | 5.39/7.62ms |
+| 1x4x2 | 11,231 | 2.74/4.82ms | 5.47/9.33ms |
+| 2x4x2 | 11,335 | 2.76/5.02ms | 5.49/8.61ms |
+| 4x8x2 | 11,218 | 2.77/5.03ms | 5.51/8.92ms |
+| 4x8x4 | 16,734 | 3.74/7.17ms | 7.22/12.50ms |
+| 8x16x8 | 17,023 | 4.55/9.54ms | 9.79/15.13ms |
+| 16x16x8 | 17,062 | 4.83/9.58ms | 9.58/15.51ms |
+
+调优结论：在本机 Redis 6.2 上，`4x8x4` 之后吞吐不再提升（约 16.7k→17.1k 持平）而 p99 持续上升（Settle p99 12.5→15.5ms）——已到达单 Redis 串行执行上限；Dispatchers 超过 1 在 batch 32 下无收益。矩阵无丢失、Dead 0。该数字只是当前机器的观测结果，不代表推荐容量、系统极限或 SLA。
+
 ## 已知限制
 
 - 交付语义为 At-Least-Once：业务副作用必须按 TaskID/effect_id 幂等，不允许 Exactly Once 假设。
