@@ -9,17 +9,20 @@ import (
 // workerLoop runs one handler. On a graceful shutdown the coordinator closes
 // the batchesClosed signal only after every dispatcher has exited, and the
 // handler then drains every already-dispatched batch instead of abandoning
-// it to Recover.
-func (r *Runner) workerLoop(runCtx context.Context, gen int64, handle BatchHandler, batchesClosed <-chan struct{}) {
+// it to Recover. A retiring worker exits at the next loop boundary after
+// finishing its current batch.
+func (r *Runner) workerLoop(runCtx context.Context, gen int64, handle BatchHandler, batchesClosed <-chan struct{}, quit <-chan struct{}) {
 	for {
 		select {
 		case <-runCtx.Done():
 			// Grace expired: batches still in the buffer are abandoned to
 			// Pending/Recover; the handler does not compute or settle them.
 			return
+		case <-quit:
+			return
 		case <-batchesClosed:
 			// No dispatcher can still be producing; drain the remainder.
-			r.drainBatches(runCtx, gen, handle)
+			r.drainBatches(runCtx, gen, handle, quit)
 			return
 		case batch := <-r.batches:
 			r.workBatch(runCtx, gen, batch, handle)
@@ -30,10 +33,12 @@ func (r *Runner) workerLoop(runCtx context.Context, gen int64, handle BatchHandl
 // drainBatches finishes every batch still buffered after the dispatchers
 // have stopped. The shared batches channel is never closed and no producer
 // remains, so each handler takes items until the channel is empty.
-func (r *Runner) drainBatches(runCtx context.Context, gen int64, handle BatchHandler) {
+func (r *Runner) drainBatches(runCtx context.Context, gen int64, handle BatchHandler, quit <-chan struct{}) {
 	for {
 		select {
 		case <-runCtx.Done():
+			return
+		case <-quit:
 			return
 		case batch := <-r.batches:
 			r.workBatch(runCtx, gen, batch, handle)

@@ -239,6 +239,20 @@ runner, err := consumer.New(consumer.Config{
 - 注意：排干期间 Handler 会继续完成已取得的批次，业务副作用可能在 context 取消后仍然发生；需要严格停止语义的宿主应在 Handler 内部检查自己的业务 context。
 - Handler 必须响应 context 取消；忽略取消的 handler 会在 Run 返回后残留，其批次由 Recover 接管。
 
+### 运行时调整并发
+
+`Runner` 支持运行中调整各阶段并发，无需重启 Run；调整量会记住并应用到下一次 Run：
+
+```go
+runner.ResizeWorkers(16)
+runner.ResizeDispatchers(4)
+runner.ResizeSettlers(8)
+```
+
+- 扩容立即生效；缩容只在其完成当前单位工作（一个 Dispatch 周期、一个批次的 Handle 及 Outcome 交接、或一个 Settle）后退场，不放弃已持有的批次。
+- 调整发生在 Run 之间时只更新目标值，下一次 Run 启动按新值建池。
+- 参数必须 ≥ 1；`MaxInFlight`/缓冲区容量不随 Resize 改变（调优优先改配置重启）。
+
 ```powershell
 go run ./cmd/echoqueue-worker -addr 127.0.0.1:6379
 ```

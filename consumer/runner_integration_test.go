@@ -546,3 +546,74 @@ func TestRunnerBlackBoxBreakerFullChainWithRealRedis(t *testing.T) {
 		t.Fatalf("settleFailed = %d, want >= 3", metrics.settleFailed.Load())
 	}
 }
+
+func TestRunnerResizeMidDrainWithRealRedis(t *testing.T) {
+	rdb, scheduler, queue, source, result, dead, _ := newBlackBoxRunner(t)
+	const taskCount = 120
+	pushTasks(t, rdb, source, taskCount)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runner, err := New(Config{
+		Dispatchers:   1,
+		Workers:       1,
+		Settlers:      1,
+		MaxInFlight:   4,
+		BatchSize:     2,
+		BatchBuffer:   4,
+		OutcomeBuffer: 4,
+		PollInterval:  time.Millisecond,
+		ErrorBackoff:  time.Millisecond,
+		ShutdownGrace: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runner.Run(ctx, queue, scheduler, func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome {
+			outcome := echoqueue.Outcome{RequestID: "runner-resize-" + batch.ID}
+			for _, task := range batch.Tasks {
+				outcome.Results = append(outcome.Results, echoqueue.Result{TaskID: task.TaskID, Data: []byte(`{"ok":true}`)})
+			}
+			return outcome
+		}, func(error) {})
+	}()
+	// Grow the pipeline mid-drain, then shrink it, then cancel cleanly.
+	pollUntil(t, 5*time.Second, "drain starts", func() bool {
+		settled, _ := rdb.LLen(context.Background(), result).Result()
+		return settled >= 20
+	})
+	if err := runner.ResizeDispatchers(2); err != nil {
+		t.Fatalf("ResizeDispatchers: %v", err)
+	}
+	if err := runner.ResizeWorkers(4); err != nil {
+		t.Fatalf("ResizeWorkers: %v", err)
+	}
+	if err := runner.ResizeSettlers(2); err != nil {
+		t.Fatalf("ResizeSettlers: %v", err)
+	}
+	testutil.WaitFor(t, 10*time.Second, func() bool {
+		remaining, _ := rdb.LLen(context.Background(), source).Result()
+		settled, _ := rdb.LLen(context.Background(), result).Result()
+		return remaining == 0 && settled == taskCount
+	})
+	if err := runner.ResizeWorkers(1); err != nil {
+		t.Fatalf("ResizeWorkers after drain: %v", err)
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	if unique := countUniqueResultIDs(t, rdb, result); unique != taskCount {
+		t.Fatalf("unique results = %d, want %d", unique, taskCount)
+	}
+	deadLen, _ := rdb.LLen(context.Background(), dead).Result()
+	if deadLen != 0 {
+		t.Fatalf("dead length = %d, want 0", deadLen)
+	}
+}

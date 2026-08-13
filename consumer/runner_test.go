@@ -28,6 +28,24 @@ func pollUntil(t *testing.T, timeout time.Duration, label string, condition func
 	}
 }
 
+// currentStageSizes reads the per-Run pool sizes through the runner's
+// poolMu, matching the synchronization Resize* and Run use for the same
+// fields.
+func currentStageSizes(r *Runner) (dispatchers, workers, settlers int) {
+	r.poolMu.Lock()
+	defer r.poolMu.Unlock()
+	if r.curDispatch != nil {
+		dispatchers = r.curDispatch.size()
+	}
+	if r.curWorkers != nil {
+		workers = r.curWorkers.size()
+	}
+	if r.curSettlers != nil {
+		settlers = r.curSettlers.size()
+	}
+	return dispatchers, workers, settlers
+}
+
 func quickRunner(t *testing.T) *Runner {
 	t.Helper()
 	runner, err := New(Config{
@@ -87,6 +105,13 @@ func (r *dispatchRecorder) peakConcurrent() int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.peak
+}
+
+func (r *dispatchRecorder) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inflight = 0
+	r.peak = 0
 }
 
 type settleRecorder struct {
@@ -917,6 +942,323 @@ func TestRunnerOutcomeBufferFullBackpressure(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not stop")
 	}
+}
+
+func TestRunnerResizeWorkersGrow(t *testing.T) {
+	runner, err := New(Config{
+		Dispatchers:   1,
+		Workers:       1,
+		Settlers:      1,
+		MaxInFlight:   4,
+		BatchSize:     1,
+		BatchBuffer:   4,
+		OutcomeBuffer: 4,
+		PollInterval:  time.Millisecond,
+		ErrorBackoff:  time.Millisecond,
+		ShutdownGrace: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	dispatch := &dispatchRecorder{batch: echoqueue.Batch{ID: "b", Tasks: []echoqueue.Task{{TaskID: "t", Payload: []byte(`{}`)}}}}
+	settle := &settleRecorder{}
+	gate := make(chan struct{})
+	var activeHandlers atomic.Int64
+	var peakHandlers atomic.Int64
+	handle := func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome {
+		value := activeHandlers.Add(1)
+		for {
+			current := peakHandlers.Load()
+			if value <= current || peakHandlers.CompareAndSwap(current, value) {
+				break
+			}
+		}
+		<-gate
+		activeHandlers.Add(-1)
+		return okOutcome(batch)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx, dispatch, settle, handle, func(error) {}) }()
+	pollUntil(t, 2*time.Second, "one worker active", func() bool { return peakHandlers.Load() >= 1 })
+	time.Sleep(50 * time.Millisecond)
+	if got := peakHandlers.Load(); got != 1 {
+		t.Fatalf("peak handlers before grow = %d, want 1", got)
+	}
+	if err := runner.ResizeWorkers(3); err != nil {
+		t.Fatalf("ResizeWorkers: %v", err)
+	}
+	pollUntil(t, 2*time.Second, "grown handlers active", func() bool { return peakHandlers.Load() >= 3 })
+	if _, workers, _ := currentStageSizes(runner); workers != 3 {
+		t.Fatalf("worker pool size = %d, want 3", workers)
+	}
+	close(gate)
+	pollUntil(t, 2*time.Second, "settle progress", func() bool { return settle.calls.Load() >= 4 })
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+}
+
+func TestRunnerResizeWorkersShrink(t *testing.T) {
+	runner, err := New(Config{
+		Dispatchers:   1,
+		Workers:       3,
+		Settlers:      1,
+		MaxInFlight:   4,
+		BatchSize:     1,
+		BatchBuffer:   4,
+		OutcomeBuffer: 4,
+		PollInterval:  time.Millisecond,
+		ErrorBackoff:  time.Millisecond,
+		ShutdownGrace: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Empty dispatches first: the three workers idle on the batch channel.
+	dispatch := &dispatchRecorder{}
+	settle := &settleRecorder{}
+	var activeHandlers atomic.Int64
+	var peakHandlers atomic.Int64
+	handle := func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome {
+		value := activeHandlers.Add(1)
+		for {
+			current := peakHandlers.Load()
+			if value <= current || peakHandlers.CompareAndSwap(current, value) {
+				break
+			}
+		}
+		activeHandlers.Add(-1)
+		return okOutcome(batch)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx, dispatch, settle, handle, func(error) {}) }()
+	pollUntil(t, 2*time.Second, "workers idle", func() bool { _, workers, _ := currentStageSizes(runner); return workers == 3 })
+	if err := runner.ResizeWorkers(1); err != nil {
+		t.Fatalf("ResizeWorkers: %v", err)
+	}
+	pollUntil(t, 2*time.Second, "pool shrunk", func() bool { _, workers, _ := currentStageSizes(runner); return workers == 1 })
+	// Only one worker remains: dispatch real batches and confirm the peak
+	// never exceeds one.
+	dispatch.mu.Lock()
+	dispatch.batch = echoqueue.Batch{ID: "b", Tasks: []echoqueue.Task{{TaskID: "t", Payload: []byte(`{}`)}}}
+	dispatch.mu.Unlock()
+	pollUntil(t, 2*time.Second, "settle progress", func() bool { return settle.calls.Load() >= 3 })
+	if got := peakHandlers.Load(); got > 1 {
+		t.Fatalf("peak handlers after shrink = %d, want 1", got)
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+}
+
+func TestRunnerResizeDispatchers(t *testing.T) {
+	runner, err := New(Config{
+		Dispatchers:   1,
+		Workers:       2,
+		Settlers:      1,
+		MaxInFlight:   8,
+		BatchSize:     1,
+		BatchBuffer:   8,
+		OutcomeBuffer: 8,
+		PollInterval:  time.Millisecond,
+		ErrorBackoff:  time.Millisecond,
+		ShutdownGrace: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	dispatch := &dispatchRecorder{batch: echoqueue.Batch{ID: "b", Tasks: []echoqueue.Task{{TaskID: "t", Payload: []byte(`{}`)}}}}
+	settle := &settleRecorder{}
+	handle := func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome { return okOutcome(batch) }
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx, dispatch, settle, handle, func(error) {}) }()
+	pollUntil(t, 2*time.Second, "dispatches flowing", func() bool { return dispatch.calls.Load() >= 5 })
+	if got := dispatch.peakConcurrent(); got != 1 {
+		t.Fatalf("peak concurrent dispatches before grow = %d, want 1", got)
+	}
+	if err := runner.ResizeDispatchers(4); err != nil {
+		t.Fatalf("ResizeDispatchers: %v", err)
+	}
+	pollUntil(t, 2*time.Second, "dispatcher concurrency", func() bool { return dispatch.peakConcurrent() >= 2 })
+	if dispatchers, _, _ := currentStageSizes(runner); dispatchers != 4 {
+		t.Fatalf("dispatcher pool size = %d, want 4", dispatchers)
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+}
+
+func TestRunnerResizeSettlers(t *testing.T) {
+	runner, err := New(Config{
+		Dispatchers:   1,
+		Workers:       2,
+		Settlers:      1,
+		MaxInFlight:   8,
+		BatchSize:     1,
+		BatchBuffer:   8,
+		OutcomeBuffer: 8,
+		PollInterval:  time.Millisecond,
+		ErrorBackoff:  time.Millisecond,
+		ShutdownGrace: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	dispatch := &dispatchRecorder{batch: echoqueue.Batch{ID: "b", Tasks: []echoqueue.Task{{TaskID: "t", Payload: []byte(`{}`)}}}}
+	settle := &settleRecorder{}
+	handle := func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome { return okOutcome(batch) }
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx, dispatch, settle, handle, func(error) {}) }()
+	pollUntil(t, 2*time.Second, "settles flowing", func() bool { return settle.calls.Load() >= 5 })
+	if got := settle.peakConcurrent(); got != 1 {
+		t.Fatalf("peak concurrent settles before grow = %d, want 1", got)
+	}
+	if err := runner.ResizeSettlers(3); err != nil {
+		t.Fatalf("ResizeSettlers: %v", err)
+	}
+	pollUntil(t, 2*time.Second, "settler concurrency", func() bool { return settle.peakConcurrent() >= 2 })
+	if _, _, settlers := currentStageSizes(runner); settlers != 3 {
+		t.Fatalf("settler pool size = %d, want 3", settlers)
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+}
+
+func TestRunnerResizePersistsAcrossRuns(t *testing.T) {
+	runner, err := New(Config{
+		Dispatchers:   1,
+		Workers:       2,
+		Settlers:      1,
+		MaxInFlight:   8,
+		BatchSize:     1,
+		BatchBuffer:   8,
+		OutcomeBuffer: 8,
+		PollInterval:  time.Millisecond,
+		ErrorBackoff:  time.Millisecond,
+		ShutdownGrace: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	dispatch := &dispatchRecorder{batch: echoqueue.Batch{ID: "b", Tasks: []echoqueue.Task{{TaskID: "t", Payload: []byte(`{}`)}}}}
+	settle := &settleRecorder{}
+	handle := func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome { return okOutcome(batch) }
+
+	// Resize before Run: the first Run starts with four dispatchers.
+	if err := runner.ResizeDispatchers(4); err != nil {
+		t.Fatalf("ResizeDispatchers before Run: %v", err)
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	run1Done := make(chan error, 1)
+	go func() { run1Done <- runner.Run(ctx1, dispatch, settle, handle, func(error) {}) }()
+	pollUntil(t, 2*time.Second, "first run dispatcher concurrency", func() bool { return dispatch.peakConcurrent() >= 2 })
+	cancel1()
+	select {
+	case err := <-run1Done:
+		if err != nil {
+			t.Fatalf("Run1 = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run1 did not stop")
+	}
+
+	// The remembered size survives the Run; shrink between Runs and the next
+	// Run starts with one dispatcher.
+	if err := runner.ResizeDispatchers(1); err != nil {
+		t.Fatalf("ResizeDispatchers between Runs: %v", err)
+	}
+	dispatch.reset()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	run2Done := make(chan error, 1)
+	go func() { run2Done <- runner.Run(ctx2, dispatch, settle, handle, func(error) {}) }()
+	pollUntil(t, 2*time.Second, "second run dispatches", func() bool { return dispatch.calls.Load() >= 10 })
+	if got := dispatch.peakConcurrent(); got != 1 {
+		t.Fatalf("peak concurrent dispatches after shrink = %d, want 1", got)
+	}
+	cancel2()
+	select {
+	case err := <-run2Done:
+		if err != nil {
+			t.Fatalf("Run2 = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run2 did not stop")
+	}
+}
+
+func TestRunnerResizeInvalid(t *testing.T) {
+	runner := quickRunner(t)
+	for name, resize := range map[string]func(int) error{
+		"workers":     runner.ResizeWorkers,
+		"dispatchers": runner.ResizeDispatchers,
+		"settlers":    runner.ResizeSettlers,
+	} {
+		for _, n := range []int{0, -1} {
+			if err := resize(n); err == nil {
+				t.Fatalf("%s(%d) accepted", name, n)
+			}
+		}
+	}
+}
+
+func TestRunnerResizeDuringShutdown(t *testing.T) {
+	runner := quickRunner(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	dispatch := &dispatchRecorder{batch: echoqueue.Batch{ID: "b", Tasks: []echoqueue.Task{{TaskID: "t", Payload: []byte(`{}`)}}}}
+	settle := &settleRecorder{}
+	handle := func(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome { return okOutcome(batch) }
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx, dispatch, settle, handle, func(error) {}) }()
+	pollUntil(t, 2*time.Second, "settle progress", func() bool { return settle.calls.Load() >= 3 })
+	cancel()
+	// Resizing during the graceful drain must neither deadlock nor leak.
+	if err := runner.ResizeWorkers(1); err != nil {
+		t.Fatalf("ResizeWorkers during shutdown: %v", err)
+	}
+	if err := runner.ResizeSettlers(1); err != nil {
+		t.Fatalf("ResizeSettlers during shutdown: %v", err)
+	}
+	if err := runner.ResizeDispatchers(1); err != nil {
+		t.Fatalf("ResizeDispatchers during shutdown: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	pollUntil(t, 2*time.Second, "token restoration", func() bool { return len(runner.permits) == 3 && len(runner.slots) == 3 })
 }
 
 func TestRunnerConfigValidation(t *testing.T) {

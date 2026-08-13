@@ -12,14 +12,17 @@ import (
 // pipeline, so Redis settle latency never occupies handler workers. On a
 // graceful shutdown the coordinator closes the outcomesClosed signal only
 // after every handler has exited, and the settler then drains every computed
-// outcome.
-func (r *Runner) settlerLoop(runCtx context.Context, settle BatchSettler, report ErrorSink, outcomesClosed <-chan struct{}) {
+// outcome. A retiring worker exits at the next loop boundary after finishing
+// its current settle.
+func (r *Runner) settlerLoop(runCtx context.Context, settle BatchSettler, report ErrorSink, outcomesClosed <-chan struct{}, quit <-chan struct{}) {
 	for {
 		select {
 		case <-runCtx.Done():
 			return
+		case <-quit:
+			return
 		case <-outcomesClosed:
-			r.drainOutcomes(runCtx, settle, report)
+			r.drainOutcomes(runCtx, settle, report, quit)
 			return
 		case item, ok := <-r.outcomes:
 			if !ok {
@@ -33,10 +36,12 @@ func (r *Runner) settlerLoop(runCtx context.Context, settle BatchSettler, report
 // drainOutcomes settles every outcome still buffered after the handlers have
 // stopped. The shared outcomes channel is never closed and no producer
 // remains, so each settler takes items until the channel is empty.
-func (r *Runner) drainOutcomes(runCtx context.Context, settle BatchSettler, report ErrorSink) {
+func (r *Runner) drainOutcomes(runCtx context.Context, settle BatchSettler, report ErrorSink, quit <-chan struct{}) {
 	for {
 		select {
 		case <-runCtx.Done():
+			return
+		case <-quit:
 			return
 		case item, ok := <-r.outcomes:
 			if !ok {

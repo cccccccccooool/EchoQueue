@@ -88,6 +88,20 @@ type Runner struct {
 	// so two generations can never close the same batch.
 	runGen atomic.Int64
 
+	// desiredDispatchers/desiredWorkers/desiredSettlers are the stage sizes
+	// used by the next Run start and updated by Resize*. They persist across
+	// Runs, so resizing between Runs changes the next Run's concurrency.
+	desiredDispatchers atomic.Int64
+	desiredWorkers     atomic.Int64
+	desiredSettlers    atomic.Int64
+
+	// poolMu guards the per-Run stage pools; Resize* manipulates them while
+	// Run is active and clears them when Run returns.
+	poolMu      sync.Mutex
+	curDispatch *stagePool
+	curWorkers  *stagePool
+	curSettlers *stagePool
+
 	// permits holds MaxInFlight tokens. A token is acquired before Dispatch
 	// and released after Settle (or after any early return).
 	permits chan struct{}
@@ -123,13 +137,67 @@ func New(cfg Config) (*Runner, error) {
 	for i := 0; i < validated.BatchBuffer; i++ {
 		slots <- struct{}{}
 	}
-	return &Runner{
+	runner := &Runner{
 		cfg:      validated,
 		permits:  permits,
 		slots:    slots,
 		batches:  make(chan echoqueue.Batch, validated.BatchBuffer),
 		outcomes: make(chan outcomeItem, validated.OutcomeBuffer),
-	}, nil
+	}
+	runner.desiredDispatchers.Store(int64(validated.Dispatchers))
+	runner.desiredWorkers.Store(int64(validated.Workers))
+	runner.desiredSettlers.Store(int64(validated.Settlers))
+	return runner, nil
+}
+
+// ResizeDispatchers changes the number of parallel Dispatch goroutines. The
+// new size applies immediately to the active Run and is remembered for the
+// next Run. Shrinking retires workers only after they finish their current
+// unit of work, so no dispatched batch is ever abandoned by a resize.
+func (r *Runner) ResizeDispatchers(n int) error {
+	if n < 1 {
+		return errors.New("echoqueue consumer: dispatchers must be positive")
+	}
+	r.desiredDispatchers.Store(int64(n))
+	r.poolMu.Lock()
+	pool := r.curDispatch
+	r.poolMu.Unlock()
+	if pool != nil {
+		pool.resize(n)
+	}
+	return nil
+}
+
+// ResizeWorkers changes the number of handler goroutines. See
+// ResizeDispatchers for the lifetime semantics.
+func (r *Runner) ResizeWorkers(n int) error {
+	if n < 1 {
+		return errors.New("echoqueue consumer: workers must be positive")
+	}
+	r.desiredWorkers.Store(int64(n))
+	r.poolMu.Lock()
+	pool := r.curWorkers
+	r.poolMu.Unlock()
+	if pool != nil {
+		pool.resize(n)
+	}
+	return nil
+}
+
+// ResizeSettlers changes the number of settle goroutines. See
+// ResizeDispatchers for the lifetime semantics.
+func (r *Runner) ResizeSettlers(n int) error {
+	if n < 1 {
+		return errors.New("echoqueue consumer: settlers must be positive")
+	}
+	r.desiredSettlers.Store(int64(n))
+	r.poolMu.Lock()
+	pool := r.curSettlers
+	r.poolMu.Unlock()
+	if pool != nil {
+		pool.resize(n)
+	}
+	return nil
 }
 
 // Run starts the dispatchers, handlers, and settlers, then blocks until ctx
@@ -196,45 +264,49 @@ func (r *Runner) Run(ctx context.Context, dispatch BatchDispatcher, settle Batch
 	batchesClosed := make(chan struct{})
 	outcomesClosed := make(chan struct{})
 
-	var wgD, wgH, wgS sync.WaitGroup
-	for i := 0; i < r.cfg.Dispatchers; i++ {
-		wgD.Add(1)
-		go func() {
-			defer wgD.Done()
-			r.dispatchLoop(ctx, dispatch, report)
-		}()
-	}
-	for i := 0; i < r.cfg.Workers; i++ {
-		wgH.Add(1)
-		go func() {
-			defer wgH.Done()
-			r.workerLoop(runCtx, gen, handle, batchesClosed)
-		}()
-	}
-	for i := 0; i < r.cfg.Settlers; i++ {
-		wgS.Add(1)
-		go func() {
-			defer wgS.Done()
-			r.settlerLoop(runCtx, settle, report, outcomesClosed)
-		}()
-	}
+	// The stage pools own the goroutines of this Run; Resize* manipulates
+	// them through r.cur* while the Run is active.
+	dispatchPool := newStagePool(func(quit <-chan struct{}) {
+		r.dispatchLoop(ctx, dispatch, report, quit)
+	})
+	workerPool := newStagePool(func(quit <-chan struct{}) {
+		r.workerLoop(runCtx, gen, handle, batchesClosed, quit)
+	})
+	settlerPool := newStagePool(func(quit <-chan struct{}) {
+		r.settlerLoop(runCtx, settle, report, outcomesClosed, quit)
+	})
+	dispatchPool.resize(int(r.desiredDispatchers.Load()))
+	workerPool.resize(int(r.desiredWorkers.Load()))
+	settlerPool.resize(int(r.desiredSettlers.Load()))
+	r.poolMu.Lock()
+	r.curDispatch = dispatchPool
+	r.curWorkers = workerPool
+	r.curSettlers = settlerPool
+	r.poolMu.Unlock()
+	defer func() {
+		r.poolMu.Lock()
+		r.curDispatch = nil
+		r.curWorkers = nil
+		r.curSettlers = nil
+		r.poolMu.Unlock()
+	}()
 
 	// The single coordinator signals each stage only after every producer
 	// goroutine of that stage has exited, and only while the drain is still
 	// graceful. After grace expiry runCtx is cancelled and no signal fires.
 	coordinated := make(chan struct{})
 	go func() {
-		wgD.Wait()
+		dispatchPool.wait()
 		if runCtx.Err() != nil {
 			return
 		}
 		close(batchesClosed)
-		wgH.Wait()
+		workerPool.wait()
 		if runCtx.Err() != nil {
 			return
 		}
 		close(outcomesClosed)
-		wgS.Wait()
+		settlerPool.wait()
 		if runCtx.Err() != nil {
 			return
 		}
@@ -272,11 +344,12 @@ func (r *Runner) Run(ctx context.Context, dispatch BatchDispatcher, settle Batch
 	}
 }
 
-func (r *Runner) wait(ctx context.Context, d time.Duration) {
+func (r *Runner) wait(ctx context.Context, d time.Duration, quit <-chan struct{}) {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+	case <-quit:
 	case <-timer.C:
 	}
 }
