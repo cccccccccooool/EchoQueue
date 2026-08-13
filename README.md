@@ -314,26 +314,26 @@ go test -race -tags=integration ./... -count=1
 
 ### Consumer 流水线并发矩阵
 
-`scripts/consumer_matrix` 针对 `consumer` 包的三阶段并发矩阵压测（每格唯一 namespace、零丢失校验、不执行 FLUSHDB）：
+`scripts/consumer_matrix` 针对 `consumer` 包的三阶段并发矩阵压测（每格唯一 namespace、零丢失校验、不执行 FLUSHDB，默认矩阵 8 格）：
 
 ```powershell
 go run ./scripts/consumer_matrix -tasks 30000 -batch-size 32
 ```
 
-最近一次本机 Redis 6.2 基线（30,000 任务/格，batch 32，MaxInFlight 16，BatchBuffer/OutcomeBuffer 8）：
+最近一次本机 Redis 6.2 基线（每格 30,000 任务、batch 32、MaxInFlight 16、BatchBuffer/OutcomeBuffer 8，**每格重复 3 次取均值**，2026-08-13）：
 
-| 配置 DxWxS | 吞吐 tasks/s | Dispatch p50/p99 | Settle p50/p99 |
+| 配置 DxWxS | 吞吐 tasks/s（3 次均值） | Settle p50 | Settle p99 |
 |---|---|---|---|
-| 1x1x1 | 5,836 | 2.78/4.63ms | 5.44/8.10ms |
-| 1x2x1 | 6,024 | 2.76/4.49ms | 5.39/7.62ms |
-| 1x4x2 | 11,231 | 2.74/4.82ms | 5.47/9.33ms |
-| 2x4x2 | 11,335 | 2.76/5.02ms | 5.49/8.61ms |
-| 4x8x2 | 11,218 | 2.77/5.03ms | 5.51/8.92ms |
-| 4x8x4 | 16,734 | 3.74/7.17ms | 7.22/12.50ms |
-| 8x16x8 | 17,023 | 4.55/9.54ms | 9.79/15.13ms |
-| 16x16x8 | 17,062 | 4.83/9.58ms | 9.58/15.51ms |
+| 1x1x1 | 6,117 | 5.2ms | 7.8ms |
+| 1x2x1 | 6,105 | 5.2ms | 7.6ms |
+| 1x4x2 | 11,630 | 5.3ms | 8.6ms |
+| 2x4x2 | 11,429 | 5.5ms | 9.2ms |
+| 4x8x2 | 11,317 | 5.5ms | 8.9ms |
+| 4x8x4 | 16,476 | 7.4ms | 12.8ms |
+| 8x16x8 | 17,425 | 9.4ms | 15.0ms |
+| 16x16x8 | 17,430 | 9.4ms | 15.0ms |
 
-调优结论：在本机 Redis 6.2 上，`4x8x4` 之后吞吐不再提升（约 16.7k→17.1k 持平）而 p99 持续上升（Settle p99 12.5→15.5ms）——已到达单 Redis 串行执行上限；Dispatchers 超过 1 在 batch 32 下无收益。矩阵无丢失、Dead 0。该数字只是当前机器的观测结果，不代表推荐容量、系统极限或 SLA。
+调优结论（只引用单变量对比对）：增加 Settlers 从 2→4 时吞吐约 +46%（4x8x2→4x8x4）；Dispatchers 1→2（1x4x2→2x4x2）与 8→16（8x16x8→16x16x8）均持平，batch 32 下增加 Dispatcher 无收益；高并发下 Settle p50/p99 随队列深度同步上升。吞吐在约 17k tasks/s 处饱和，符合单 Redis 串行执行上限。矩阵无丢失、Dead 0。该数字只是当前机器的观测结果，不代表推荐容量、系统极限或 SLA；单次运行的格间噪声约 ±3%（异常运行可更高，本表为均值）。
 
 ## 已知限制
 

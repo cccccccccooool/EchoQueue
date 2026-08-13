@@ -55,10 +55,11 @@ func (r *Runner) dispatchOnce(ctx context.Context, dispatch BatchDispatcher, rep
 	batch, err := dispatch.Dispatch(ctx, r.cfg.BatchSize)
 	if err != nil {
 		r.cfg.Metrics.DispatchFailed()
-		report(fmt.Errorf("echoqueue consumer: dispatch: %w", err))
 		if ctx.Err() != nil {
+			// Cancellation noise during shutdown; not a real failure.
 			return
 		}
+		report(fmt.Errorf("echoqueue consumer: dispatch: %w", err))
 		r.wait(ctx, jittered(r.cfg.ErrorBackoff))
 		return
 	}

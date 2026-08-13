@@ -48,7 +48,7 @@ func main() {
 	maxInFlight := flag.Int("max-in-flight", envInt("ECHOQUEUE_MATRIX_MAX_IN_FLIGHT", 16), "MaxInFlight per cell")
 	batchBuffer := flag.Int("batch-buffer", envInt("ECHOQUEUE_MATRIX_BATCH_BUFFER", 8), "BatchBuffer per cell")
 	outcomeBuffer := flag.Int("outcome-buffer", envInt("ECHOQUEUE_MATRIX_OUTCOME_BUFFER", 8), "OutcomeBuffer per cell")
-	matrix := flag.String("matrix", envString("ECHOQUEUE_MATRIX", "1x1x1,1x2x1,1x4x2,2x4x2,4x8x2,4x8x4"), "comma-separated DispatchersxWorkersxSettlers cells")
+	matrix := flag.String("matrix", envString("ECHOQUEUE_MATRIX", "1x1x1,1x2x1,1x4x2,2x4x2,4x8x2,4x8x4,8x16x8,16x16x8"), "comma-separated DispatchersxWorkersxSettlers cells")
 	timeout := flag.Duration("timeout", envDuration("ECHOQUEUE_MATRIX_TIMEOUT", 120*time.Second), "per-cell timeout")
 	flag.Parse()
 
@@ -63,18 +63,19 @@ func main() {
 	fmt.Printf("consumer matrix: redis=%s tasks=%d batch=%d max_in_flight=%d batch_buffer=%d outcome_buffer=%d timeout=%s\n",
 		*address, *tasks, *batchSize, *maxInFlight, *batchBuffer, *outcomeBuffer, timeout)
 	fmt.Println("every cell uses unique keys and cleans only its own Redis data.")
-	fmt.Printf("%-12s %10s %10s %10s %12s %12s\n", "cell", "throughput", "dispatch", "settle", "dispatch", "settle")
-	fmt.Printf("%-12s %10s %10s %10s %12s %12s\n", "", "tasks/s", "p50", "p50", "p99", "p99")
+	fmt.Printf("%-12s %10s %10s %10s %10s %12s %12s\n", "cell", "throughput", "dispatch", "dispatch", "settle", "dispatch", "settle")
+	fmt.Printf("%-12s %10s %10s %10s %10s %12s %12s\n", "", "tasks/s", "p50", "p95", "p50", "p99", "p99")
 
 	for _, current := range cells {
 		result, err := runCell(context.Background(), *address, *tasks, *batchSize, *maxInFlight, *batchBuffer, *outcomeBuffer, *timeout, current)
 		if err != nil {
 			fatalf("cell %dx%dx%d failed: %v", current.dispatchers, current.workers, current.settlers, err)
 		}
-		fmt.Printf("%dx%dx%d %10.0f %10s %10s %12s %12s\n",
+		fmt.Printf("%dx%dx%d %10.0f %10s %10s %10s %12s %12s\n",
 			current.dispatchers, current.workers, current.settlers,
 			result.throughput,
 			result.dispatch[0.5].Round(time.Microsecond),
+			result.dispatch[0.95].Round(time.Microsecond),
 			result.settle[0.5].Round(time.Microsecond),
 			result.dispatch[0.99].Round(time.Microsecond),
 			result.settle[0.99].Round(time.Microsecond))
@@ -148,6 +149,8 @@ func runCell(parent context.Context, address string, tasks, batchSize, maxInFlig
 	}
 
 	runErr := make(chan error, 1)
+	var firstErr error
+	var errorMu sync.Mutex
 	go func() {
 		runErr <- runner.Run(ctx,
 			&timedDispatcher{queue: queue, latency: dispatchLat},
@@ -160,15 +163,39 @@ func runCell(parent context.Context, address string, tasks, batchSize, maxInFlig
 				return outcome
 			},
 			func(err error) {
+				if err == nil {
+					return
+				}
 				fmt.Fprintf(os.Stderr, "cell %dx%dx%d: %v\n", current.dispatchers, current.workers, current.settlers, err)
+				errorMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					cancel()
+				}
+				errorMu.Unlock()
 			})
 	}()
 
 	drainStart := time.Now()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resultLen, _ := client.LLen(context.Background(), resultKey).Result()
-		sourceLeft, _ := client.LLen(context.Background(), source).Result()
+		if ctx.Err() != nil {
+			errorMu.Lock()
+			err := firstErr
+			errorMu.Unlock()
+			if err != nil {
+				return cellResult{}, fmt.Errorf("runner reported: %w", err)
+			}
+			break
+		}
+		resultLen, err := client.LLen(context.Background(), resultKey).Result()
+		if err != nil {
+			return cellResult{}, fmt.Errorf("poll result length: %w", err)
+		}
+		sourceLeft, err := client.LLen(context.Background(), source).Result()
+		if err != nil {
+			return cellResult{}, fmt.Errorf("poll source length: %w", err)
+		}
 		if resultLen == int64(tasks) && sourceLeft == 0 {
 			break
 		}
@@ -186,8 +213,14 @@ func runCell(parent context.Context, address string, tasks, batchSize, maxInFlig
 		return cellResult{}, fmt.Errorf("runner did not stop after cancellation")
 	}
 
-	remaining, _ := client.LLen(context.Background(), source).Result()
-	dead, _ := client.LLen(context.Background(), deadKey).Result()
+	remaining, err := client.LLen(context.Background(), source).Result()
+	if err != nil {
+		return cellResult{}, err
+	}
+	dead, err := client.LLen(context.Background(), deadKey).Result()
+	if err != nil {
+		return cellResult{}, err
+	}
 	if remaining != 0 {
 		return cellResult{}, fmt.Errorf("source remaining = %d (timeout?)", remaining)
 	}
@@ -269,7 +302,14 @@ func (r *latencyRecorder) percentiles(ps ...float64) map[float64]time.Duration {
 			result[p] = 0
 			continue
 		}
-		result[p] = sorted[int(float64(len(sorted)-1)*p)]
+		index := int(float64(len(sorted)-1) * p)
+		if index < 0 {
+			index = 0
+		}
+		if index >= len(sorted) {
+			index = len(sorted) - 1
+		}
+		result[p] = sorted[index]
 	}
 	return result
 }
@@ -302,11 +342,13 @@ func parseMatrix(raw string) ([]cell, error) {
 }
 
 func cleanupKeys(ctx context.Context, client *redis.Client, namespace string, hostKeys ...string) {
+	cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	keys := append([]string{}, hostKeys...)
 	prefix := "echoqueue:1:" + base64.RawURLEncoding.EncodeToString([]byte(namespace))
 	var cursor uint64
 	for {
-		found, nextCursor, err := client.Scan(ctx, cursor, prefix+"*", 256).Result()
+		found, nextCursor, err := client.Scan(cleanupCtx, cursor, prefix+"*", 256).Result()
 		if err != nil {
 			break
 		}
@@ -317,7 +359,7 @@ func cleanupKeys(ctx context.Context, client *redis.Client, namespace string, ho
 		}
 	}
 	if len(keys) > 0 {
-		_, _ = client.Del(ctx, keys...).Result()
+		_, _ = client.Del(cleanupCtx, keys...).Result()
 	}
 }
 
