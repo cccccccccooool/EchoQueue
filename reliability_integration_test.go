@@ -305,6 +305,43 @@ func TestDeferRecoverWrongTypeReceiptDefersWithPending(t *testing.T) {
 	}
 }
 
+func TestDeferRecoverAdvancesBeyondCurrentDeadline(t *testing.T) {
+	f := newFixture(t, 0, time.Second)
+	ctx := context.Background()
+	now, err := f.rdb.Time(ctx).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchID := "defer-advance"
+	// The defer script only inspects the pending key's type; a corrupt value
+	// keeps the recovery-failure shape without being parseable.
+	if err := f.rdb.Set(ctx, pendingKey(f.namespace, batchID), "{corrupt", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	// A deadline still in the future: the defer must advance from the current
+	// score plus the delay, not from the server clock plus the delay, or a
+	// recovery failure inside the same millisecond as Dispatch would leave the
+	// deadline unmoved.
+	if err := f.rdb.ZAdd(ctx, deadlineKey(f.namespace), redis.Z{
+		Score:  float64(now.UnixMilli()) + 5000,
+		Member: batchID,
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	status, _, err := evalDeferStatus(t, f, batchID, 1000)
+	if err != nil || status != "deferred" {
+		t.Fatalf("defer = %q, err=%v", status, err)
+	}
+	after, err := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batchID).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after < float64(now.UnixMilli())+6000 {
+		t.Fatalf("deferred deadline %v did not advance past current deadline + delay", after)
+	}
+}
+
 func TestDeferRecoverInvalidDeadlinePreservesEvidence(t *testing.T) {
 	f := newFixture(t, 0, time.Second)
 	seedTask(t, f, "defer-wrong-deadline-type")

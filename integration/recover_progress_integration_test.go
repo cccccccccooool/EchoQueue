@@ -56,11 +56,22 @@ func TestRecoverCrossesMultipleBoundedWindows(t *testing.T) {
 		if err := f.rdb.Set(ctx, pendingKey(f.namespace, batch.ID), raw, 0).Err(); err != nil {
 			t.Fatal(err)
 		}
-		score, err := f.rdb.ZScore(ctx, deadlineKey(f.namespace), batch.ID).Result()
-		if err != nil {
+	}
+	now, err := f.rdb.Time(ctx).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Dispatch deadlines share Redis TIME's millisecond resolution, and
+	// ZRANGEBYSCORE breaks score ties by member (batch id) lexicographic
+	// order, so back-to-back dispatches can be scanned out of insertion order
+	// on fast machines. Rewrite the deadlines with strictly increasing scores
+	// to make the per-window scan order deterministic.
+	for i, batchID := range badIDs {
+		score := float64(now.UnixMilli()) + float64(2*i)
+		if err := f.rdb.ZAdd(ctx, deadlineKey(f.namespace), redis.Z{Score: score, Member: batchID}).Err(); err != nil {
 			t.Fatal(err)
 		}
-		initialScores[batch.ID] = score
+		initialScores[batchID] = score
 	}
 	seedTask(t, f, "cross-window-normal")
 	normal, err := f.queue.Dispatch(ctx, 1)

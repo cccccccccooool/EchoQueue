@@ -53,7 +53,16 @@ end
 local function deferPending()
   local now = redis.call('TIME')
   local nowMillis = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-  local deferAt = nowMillis + errorDelayMillis
+  -- Advance from the later of the server clock and the current deadline.
+  -- Deadlines are stored at millisecond resolution, so a defer executed in
+  -- the same millisecond as the original Dispatch would otherwise write the
+  -- same score and leave the deadline unmoved.
+  local current = redis.call('ZSCORE', deadlineKey, batchID)
+  local base = nowMillis
+  if current and tonumber(current) > base then
+    base = tonumber(current)
+  end
+  local deferAt = base + errorDelayMillis
   redis.call('ZADD', deadlineKey, deferAt, batchID)
   return {'deferred', tostring(deferAt)}
 end
