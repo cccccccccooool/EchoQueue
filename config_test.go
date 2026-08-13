@@ -202,6 +202,31 @@ func TestDispatchContextCancellationFailsBeforeRedisWrite(t *testing.T) {
 	}
 }
 
+func TestSettleTransientErrorClassification(t *testing.T) {
+	// A Settle against an unreachable Redis must classify as a transient
+	// Redis interaction failure so hosts can trip a circuit breaker, while
+	// validation rejections must not.
+	scheduler, err := New(testClient(), Config{Namespace: "transient"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = scheduler.Settle(ctx, "transient-batch", Outcome{
+		RequestID: "transient-request",
+		Results:   []Result{{TaskID: "t", Data: []byte(`{"ok":true}`)}},
+	})
+	if err == nil {
+		t.Fatal("Settle against an unreachable Redis unexpectedly succeeded")
+	}
+	if !errors.Is(err, ErrTransientRedis) {
+		t.Fatalf("unreachable-Redis Settle error = %v, want ErrTransientRedis", err)
+	}
+	if !errors.Is(err, errSettle) {
+		t.Fatalf("unreachable-Redis Settle error = %v, want errSettle preserved", err)
+	}
+}
+
 func TestConfigNormalizationBoundaries(t *testing.T) {
 	badUTF8 := string([]byte{0xff, 0xfe})
 	tests := []struct {

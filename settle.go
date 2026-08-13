@@ -20,6 +20,12 @@ var settleScript = redis.NewScript(settleScriptSource)
 
 var errSettle = errors.New("echoqueue: settle failed")
 
+// ErrTransientRedis is wrapped into Settle errors caused by transient Redis
+// interactions (capability probe, Pending read, or script execution), as
+// opposed to validation or business rejections. Hosts match it with
+// errors.Is to decide whether to back off or trip a circuit breaker.
+var ErrTransientRedis = errors.New("echoqueue: transient redis failure")
+
 // errResultTooLarge is the internal, unexported marker for Settle outcomes
 // whose Result data exceeds the configured byte limits. Oversized results are
 // rejected before any Redis capability probe, Pending read, or Lua call, so
@@ -45,7 +51,7 @@ func (s *Scheduler) Settle(ctx context.Context, batchID string, outcome Outcome)
 		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %v", errSettle, err)
 	}
 	if err := s.ensureRedis(ctx); err != nil {
-		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, err
+		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %w: redis probe: %v", errSettle, ErrTransientRedis, err)
 	}
 	command, err := commandHash(batchID, outcome)
 	if err != nil {
@@ -58,7 +64,7 @@ func (s *Scheduler) Settle(ctx context.Context, batchID string, outcome Outcome)
 	var snapshot pendingSnapshot
 	pendingRaw, pendingErr := s.rdb.Get(ctx, pendingKey).Result()
 	if pendingErr != nil && pendingErr != redis.Nil {
-		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: read pending: %v", errSettle, pendingErr)
+		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %w: read pending: %v", errSettle, ErrTransientRedis, pendingErr)
 	}
 	resultRecords := make([]resultRecord, 0)
 	retryTasks := make([]Task, 0)
@@ -113,7 +119,7 @@ func (s *Scheduler) Settle(ctx context.Context, batchID string, outcome Outcome)
 	value, err := settleScript.Eval(ctx, s.rdb, []string{pendingKey, receiptKey, deadlineKey, resultKey, sourceKey, deadKey},
 		batchID, outcome.RequestID, command, string(receiptJSON), string(resultJSON), string(retryJSON), string(deadJSON), s.config.ReceiptTTL.Milliseconds()).Result()
 	if err != nil {
-		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: Redis script: %v", errSettle, err)
+		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %w: Redis script: %v", errSettle, ErrTransientRedis, err)
 	}
 	return parseReceiptResponse(batchID, value, errSettle)
 }

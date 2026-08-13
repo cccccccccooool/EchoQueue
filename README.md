@@ -16,7 +16,7 @@ EchoQueue 以 Redis List 为输入输出载体、以 Lua 脚本完成批次原�
 - [API 概览](#api-概览)
 - [可靠性语义](#可靠性语义)
 - [结果大小限制](#结果大小限制)
-- [有界消费（宿主 Worker Pool）](#有界消费宿主-worker-pool)
+- [有界消费（Consumer 分阶段流水线）](#有界消费consumer-分阶段流水线)
 - [Dead 可靠归档](#dead-可靠归档)
 - [测试与验证](#测试与验证)
 - [性能基线](#性能基线)
@@ -28,7 +28,7 @@ EchoQueue 以 Redis List 为输入输出载体、以 Lua 脚本完成批次原�
 - **不可变 Pending 快照**：Dispatch 时固化批次配置与任务数据，不设置普通 TTL；Settle 不需要调用方重复路由信息。
 - **Receipt 首终态栅栏**：第一个合法 Settle 或 Recover 获胜，其余请求按 `duplicate` / `conflict` / `stale` 分类。
 - **结果大小硬限制**：超限结果在访问 Redis 之前被拒绝，不写 Effect、不写 Receipt、不删除 Pending/deadline、不做分片拆分。
-- **宿主有界 Worker Pool 参考**：permit 先行、Worker/Buffer/in-flight 全硬上限、关闭与世代守卫，仅作宿主范式，不扩张核心 API。
+- **宿主 Consumer 流水线参考**：permit 先行、Dispatcher/Handler/Settler/in-flight 全硬上限、Settle 熔断、关闭与世代守卫，仅作宿主范式，不扩张核心 API。
 - **Dead 可靠归档参考**：durable claim（BLMOVE）→ 外部幂等持久化 → 成功后 ACK 删除，崩溃窗口最多造成幂等重复。
 - **真实 Redis 测试套件**：integration build tag 全量使用真实 Redis 6.2+，覆盖竞态、随机顺序、race 与故障窗口。
 
@@ -203,22 +203,39 @@ Settle 在第一次访问 Redis 之前校验每个 `Result.Data` 的原始 JSON 
 {"ref": "s3://bucket/key", "size": 42, "sha256": "..."}
 ```
 
-## 有界消费（宿主 Worker Pool）
+## 有界消费（Consumer 分阶段流水线）
 
-`cmd/echoqueue-worker/` 是可编译、可直接运行的宿主参考程序，演示如何用现有公开 API 构造有界消费与 Dead 归档，不扩张 EchoQueue 核心 API 或 Config。Worker 调用顺序必须固定：
+`consumer/` 包提供可导入的分阶段消费流水线：**Dispatcher → 有界 Batch Channel → Handler → 有界 Outcome Channel → Settler**，三个阶段并发数独立可配，共享全局 `MaxInFlight` 配额。`cmd/echoqueue-worker/` 是可编译、可直接运行的宿主参考程序，演示如何用现有公开 API 构造有界消费与 Dead 归档，不扩张 EchoQueue 核心 API 或 Config。批次调用顺序必须固定：
 
 ```text
-Acquire worker permit
+Acquire global permit
   -> Dispatch
   -> Handle
   -> Settle
   -> Release permit
 ```
 
-- permit 与 buffer slot 在 Dispatch 之前取得：Pool 满时停止 Dispatch，任务留在 Source；已 Dispatch 批次总能立即进入有界通道。
-- Worker、Buffer、in-flight 批次全部硬上限；慢 Handler 形成背压而非无界预取。
-- Dispatch 后进程退出：批次已有 Pending/deadline，由 Recover 接管；Pool 只是背压与短期缓冲，不是可靠状态来源。
-- 关闭：context 取消后停止新 Dispatch；ShutdownGrace 内完成 in-flight，超时后剩余批次连同容量归还、交由 Recover。世代守卫保证旧世代 worker 不结算批次。
+```go
+runner, err := consumer.New(consumer.Config{
+	Dispatchers:   1,
+	Workers:       4,
+	Settlers:      2,
+	MaxInFlight:   16,
+	BatchSize:     1,
+	BatchBuffer:   8,
+	OutcomeBuffer: 8,
+	PollInterval:  time.Second,
+	ErrorBackoff:  500 * time.Millisecond,
+	ShutdownGrace: 5 * time.Second,
+})
+```
+
+- permit 与 batch slot 在 Dispatch 之前取得：流水线满时停止 Dispatch，任务留在 Source；已 Dispatch 批次总能立即进入有界通道。
+- Dispatcher/Handler/Settler/in-flight 批次全部硬上限；慢 Handler 形成背压而非无界预取。Dispatchers 超过 1~4 通常无益，Redis Lua 在服务端串行执行。
+- Settle 连续失败 3 次触发熔断：暂停 Dispatch，按带抖动的 ErrorBackoff 半开探测，Settle 成功后恢复，避免 Redis 故障期间无界预取。只有包装 `echoqueue.ErrTransientRedis` 的瞬时 Redis 交互错误计数熔断，校验/业务拒绝（`ReceiptInvalid`）不计数。
+- Dispatch 后进程退出：批次已有 Pending/deadline，由 Recover 接管；流水线只是背压与短期缓冲，不是可靠状态来源。
+- 关闭：context 取消后停止新 Dispatch；Handler/Settler 在 ShutdownGrace 内排干已 Dispatch 批次与已计算 Outcome，超时后剩余批次连同容量归还、交由 Recover。世代守卫保证旧世代 outcome 不跨代结算。
+- 注意：排干期间 Handler 会继续完成已取得的批次，业务副作用可能在 context 取消后仍然发生；需要严格停止语义的宿主应在 Handler 内部检查自己的业务 context。
 - Handler 必须响应 context 取消；忽略取消的 handler 会在 Run 返回后残留，其批次由 Recover 接管。
 
 ```powershell
