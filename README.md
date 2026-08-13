@@ -1,6 +1,8 @@
 # EchoQueue
 
-面向个人/中小项目的轻量 Redis 批处理 Go 库。以 Redis List 为输入输出载体、以 Lua 脚本完成批次原子边界，交付语义为 **At-Least-Once**：允许幂等重复，不允许静默丢失。
+> **项目定位：个人自用。** EchoQueue 是为个人项目和中小型任务设计的轻量 Redis 批处理 Go 库，不是通用消息队列、分布式任务平台或大型生产基础设施。使用前应确认业务能够接受 At-Least-Once 语义并实现幂等处理。
+
+EchoQueue 以 Redis List 为输入输出载体、以 Lua 脚本完成批次原子边界，交付语义为 **At-Least-Once**：允许幂等重复，不允许静默丢失。
 
 目标环境：**Redis 6.2+ standalone 或 replication primary**。不支持 Redis Cluster、Streams、服务化与外部配置中心。
 
@@ -19,8 +21,6 @@
 - [测试与验证](#测试与验证)
 - [性能基线](#性能基线)
 - [已知限制](#已知限制)
-- [版本与升级](#版本与升级)
-- [发布状态](#发布状态)
 
 ## 特性
 
@@ -205,7 +205,7 @@ Settle 在第一次访问 Redis 之前校验每个 `Result.Data` 的原始 JSON 
 
 ## 有界消费（宿主 Worker Pool）
 
-`examples/reliable_consumer/` 是可编译的宿主参考程序，演示如何用现有公开 API 构造有界消费与 Dead 归档，不扩张 EchoQueue 核心 API 或 Config。Worker 调用顺序必须固定：
+`cmd/echoqueue-worker/` 是可编译、可直接运行的宿主参考程序，演示如何用现有公开 API 构造有界消费与 Dead 归档，不扩张 EchoQueue 核心 API 或 Config。Worker 调用顺序必须固定：
 
 ```text
 Acquire worker permit
@@ -222,7 +222,7 @@ Acquire worker permit
 - Handler 必须响应 context 取消；忽略取消的 handler 会在 Run 返回后残留，其批次由 Recover 接管。
 
 ```powershell
-go run ./examples/reliable_consumer -addr 127.0.0.1:6379
+go run ./cmd/echoqueue-worker -addr 127.0.0.1:6379
 ```
 
 ## Dead 可靠归档
@@ -248,7 +248,7 @@ go run ./examples/reliable_consumer -addr 127.0.0.1:6379
 参考程序默认**不启动**归档器；显式启用时使用仅演示的日志 Sink（返回错误、永不删除记录）：
 
 ```powershell
-go run ./examples/reliable_consumer -enable-archive -addr 127.0.0.1:6379
+go run ./cmd/echoqueue-worker -enable-archive -addr 127.0.0.1:6379
 ```
 
 生产环境必须提供自己的幂等 `DeadSink`（数据库、对象存储或文件系统），再启用归档。
@@ -280,13 +280,15 @@ go test -race -tags=integration ./... -count=1
 
 ## 性能基线
 
+**使用建议：本项目仅推荐承担个人项目和中小型任务。** 适合任务规模、峰值积压和故障恢复窗口均可控，且宿主能够提供 Redis 容量监控、业务幂等和人工处理 Dead 记录的场景。若任务持续高并发、积压不可预测、要求多节点水平扩展或严格 SLA，应选择成熟的消息队列或任务平台，而不是依据下述本机压测数字直接扩容使用 EchoQueue。
+
 性能脚本位于 `scripts/run-performance.ps1`，只使用唯一 namespace 与宿主 List，结束后只清理本轮数据，不执行 `FLUSHDB`：
 
 ```powershell
 ./scripts/run-performance.ps1 -RedisAddress 127.0.0.1:6380
 ```
 
-默认基线包含连续消费、预灌后间隔消费，以及 1x/4x/8x 并发生产与消费压力场景。最近一次本地 Redis 基线处理 72,000 个逻辑任务、73,440 次投递尝试，连续消费约 13,948/s，20ms 间隔消费约 3,759/s，8x 压力消费约 18,958/s；Result 唯一任务数 72,000，Dead 0，Source 余量 0。追加的 8x/16x/32x 边界观察在 32x 时约 21,575/s，仍未出现错误，但这只是当前机器的观测上限，不是系统极限。
+默认基线包含连续消费、预灌后间隔消费，以及 1x/4x/8x 并发生产与消费压力场景。最近一次本地 Redis 基线处理 72,000 个逻辑任务、73,440 次投递尝试，连续消费约 13,948/s，20ms 间隔消费约 3,759/s，8x 压力消费约 18,958/s；Result 唯一任务数 72,000，Dead 0，Source 余量 0。追加的 8x/16x/32x 边界观察在 32x 时约 21,575/s，仍未出现错误，但这只是当前机器的观测结果，不代表推荐容量、系统极限或 SLA。
 
 压测会在每个逻辑任务首次投递时按默认 2% 注入一次可恢复失败，用于验证重试链路；最近基线的整体重试率为 2.00%，重试投递率为 1.96%，丢失率为 0.0000%。这里的丢失率定义为最终未出现在唯一 Result 或 Dead 记录中的逻辑任务比例。该吞吐是当前本机 Docker Redis 的可复现实验基线，不是生产容量承诺；交付语义仍是 At-Least-Once，不是 Exactly Once。
 

@@ -29,7 +29,7 @@ import (
 
 // errPoolAlreadyActive mirrors Scheduler's ErrRunAlreadyActive: a pool may
 // only have one active Run call.
-var errPoolAlreadyActive = errors.New("echoqueue example: pool is already running")
+var errPoolAlreadyActive = errors.New("echoqueue worker: pool is already running")
 
 // BatchDispatcher is the host-local dispatch boundary. echoqueue.*Queue
 // satisfies it.
@@ -95,10 +95,10 @@ func (c PoolConfig) validated() (PoolConfig, error) {
 		c.ShutdownGrace = defaults.ShutdownGrace
 	}
 	if c.Workers <= 0 || c.MaxInFlight <= 0 || c.Buffer <= 0 || c.BatchSize <= 0 {
-		return PoolConfig{}, errors.New("echoqueue example: workers, max_in_flight, buffer, and batch_size must be positive")
+		return PoolConfig{}, errors.New("echoqueue worker: workers, max_in_flight, buffer, and batch_size must be positive")
 	}
 	if c.PollInterval <= 0 || c.ShutdownGrace <= 0 {
-		return PoolConfig{}, errors.New("echoqueue example: poll_interval and shutdown_grace must be positive")
+		return PoolConfig{}, errors.New("echoqueue worker: poll_interval and shutdown_grace must be positive")
 	}
 	return c, nil
 }
@@ -180,10 +180,10 @@ func NewPool(cfg PoolConfig) (*BoundedPool, error) {
 // without losing observability.
 func (p *BoundedPool) Run(ctx context.Context, dispatch BatchDispatcher, settle BatchSettler, handle BatchHandler, report ErrorSink) error {
 	if ctx == nil {
-		return errors.New("echoqueue example: context is nil")
+		return errors.New("echoqueue worker: context is nil")
 	}
 	if dispatch == nil || settle == nil || handle == nil || report == nil {
-		return errors.New("echoqueue example: dispatch, settle, handle, and report are required")
+		return errors.New("echoqueue worker: dispatch, settle, handle, and report are required")
 	}
 	p.startMu.Lock()
 	if p.active {
@@ -268,7 +268,7 @@ func (p *BoundedPool) dispatchLoop(ctx context.Context, dispatch BatchDispatcher
 			}
 			batch, err := dispatch.Dispatch(ctx, p.cfg.BatchSize)
 			if err != nil {
-				report(fmt.Errorf("echoqueue example: dispatch: %w", err))
+				report(fmt.Errorf("echoqueue worker: dispatch: %w", err))
 				p.slots <- struct{}{}
 				p.permits <- struct{}{}
 				if ctx.Err() != nil {
@@ -336,11 +336,11 @@ func (p *BoundedPool) workBatch(ctx context.Context, gen int64, batch echoqueue.
 		// Settle failed: the batch must not be treated as a success, and no
 		// in-memory retry queue is created. Pending/deadline remain in Redis
 		// and Recover will eventually close the batch.
-		report(fmt.Errorf("echoqueue example: settle batch %q: %w", batch.ID, err))
+		report(fmt.Errorf("echoqueue worker: settle batch %q: %w", batch.ID, err))
 		return
 	}
 	if receipt.Status == echoqueue.ReceiptInvalid {
-		report(fmt.Errorf("echoqueue example: settle batch %q returned an invalid receipt", batch.ID))
+		report(fmt.Errorf("echoqueue worker: settle batch %q returned an invalid receipt", batch.ID))
 	}
 }
 

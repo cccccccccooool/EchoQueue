@@ -31,7 +31,7 @@ import (
 
 // errArchiverAlreadyActive mirrors Scheduler's ErrRunAlreadyActive: an
 // archiver may only have one active Run call.
-var errArchiverAlreadyActive = errors.New("echoqueue example: dead archiver is already running")
+var errArchiverAlreadyActive = errors.New("echoqueue worker: dead archiver is already running")
 
 // DeadRecord is one raw Dead list element plus its parsed idempotency key.
 type DeadRecord struct {
@@ -74,10 +74,10 @@ type ArchiverConfig struct {
 func (c ArchiverConfig) validated() (ArchiverConfig, error) {
 	defaults := defaultArchiverConfig()
 	if c.DeadKey == "" || c.ProcessingKey == "" {
-		return ArchiverConfig{}, errors.New("echoqueue example: dead and processing keys are required")
+		return ArchiverConfig{}, errors.New("echoqueue worker: dead and processing keys are required")
 	}
 	if c.DeadKey == c.ProcessingKey {
-		return ArchiverConfig{}, errors.New("echoqueue example: dead and processing keys must be distinct")
+		return ArchiverConfig{}, errors.New("echoqueue worker: dead and processing keys must be distinct")
 	}
 	if c.BatchSize == 0 {
 		c.BatchSize = defaults.BatchSize
@@ -92,7 +92,7 @@ func (c ArchiverConfig) validated() (ArchiverConfig, error) {
 		c.ErrorBackoff = defaults.ErrorBackoff
 	}
 	if c.BatchSize <= 0 || c.FlushInterval <= 0 || c.ClaimTimeout <= 0 || c.ErrorBackoff <= 0 {
-		return ArchiverConfig{}, errors.New("echoqueue example: batch_size, flush_interval, claim_timeout, and error_backoff must be positive")
+		return ArchiverConfig{}, errors.New("echoqueue worker: batch_size, flush_interval, claim_timeout, and error_backoff must be positive")
 	}
 	return c, nil
 }
@@ -119,7 +119,7 @@ type DeadArchiver struct {
 // NewDeadArchiver constructs the archiver. It does not contact Redis.
 func NewDeadArchiver(rdb *redis.Client, cfg ArchiverConfig, sink DeadSink) (*DeadArchiver, error) {
 	if rdb == nil || sink == nil {
-		return nil, errors.New("echoqueue example: redis client and dead sink are required")
+		return nil, errors.New("echoqueue worker: redis client and dead sink are required")
 	}
 	validated, err := cfg.validated()
 	if err != nil {
@@ -137,10 +137,10 @@ func NewDeadArchiver(rdb *redis.Client, cfg ArchiverConfig, sink DeadSink) (*Dea
 // reported. Run returns errArchiverAlreadyActive if called twice concurrently.
 func (a *DeadArchiver) Run(ctx context.Context, report ErrorSink) error {
 	if ctx == nil {
-		return errors.New("echoqueue example: context is nil")
+		return errors.New("echoqueue worker: context is nil")
 	}
 	if report == nil {
-		return errors.New("echoqueue example: error sink is required")
+		return errors.New("echoqueue worker: error sink is required")
 	}
 	a.startMu.Lock()
 	if a.active {
@@ -157,7 +157,7 @@ func (a *DeadArchiver) Run(ctx context.Context, report ErrorSink) error {
 
 	// Replay the durable claim left by an earlier run before claiming more.
 	if err := a.replayProcessing(ctx, report); err != nil {
-		return fmt.Errorf("echoqueue example: replay processing: %w", err)
+		return fmt.Errorf("echoqueue worker: replay processing: %w", err)
 	}
 
 	buffer := make([]DeadRecord, 0, a.cfg.BatchSize)
@@ -173,7 +173,7 @@ func (a *DeadArchiver) Run(ctx context.Context, report ErrorSink) error {
 		if err := ctx.Err(); err != nil {
 			if len(buffer) > 0 {
 				if err := a.flush(ctx, buffer); err != nil {
-					report(fmt.Errorf("echoqueue example: final flush: %w", err))
+					report(fmt.Errorf("echoqueue worker: final flush: %w", err))
 				}
 			}
 			return nil
@@ -214,13 +214,13 @@ func (a *DeadArchiver) Run(ctx context.Context, report ErrorSink) error {
 			switch {
 			case probeErr != nil:
 				if ctx.Err() == nil {
-					report(fmt.Errorf("echoqueue example: probe dead head: %w", probeErr))
+					report(fmt.Errorf("echoqueue worker: probe dead head: %w", probeErr))
 				}
 			case clean:
 				corruptStreak = 0
 				continue
 			default:
-				report(fmt.Errorf("echoqueue example: dead head rejected after %d consecutive corrupt claims; claiming paused until the head is parseable", corruptStreak))
+				report(fmt.Errorf("echoqueue worker: dead head rejected after %d consecutive corrupt claims; claiming paused until the head is parseable", corruptStreak))
 			}
 			a.wait(ctx)
 			continue
@@ -233,7 +233,7 @@ func (a *DeadArchiver) Run(ctx context.Context, report ErrorSink) error {
 			if ctx.Err() != nil {
 				continue
 			}
-			report(fmt.Errorf("echoqueue example: claim dead record: %w", err))
+			report(fmt.Errorf("echoqueue worker: claim dead record: %w", err))
 			a.wait(ctx)
 			continue
 		}
@@ -244,7 +244,7 @@ func (a *DeadArchiver) Run(ctx context.Context, report ErrorSink) error {
 		if err != nil {
 			// The record stays in DeadProcessing and is never ACKed; it will
 			// be reported again on restart.
-			report(fmt.Errorf("echoqueue example: dead record rejected: %w", err))
+			report(fmt.Errorf("echoqueue worker: dead record rejected: %w", err))
 			corruptStreak++
 			continue
 		}
@@ -290,7 +290,7 @@ func (a *DeadArchiver) replayProcessing(ctx context.Context, report ErrorSink) e
 		for _, raw := range raws {
 			record, err := parseDeadRecord(raw)
 			if err != nil {
-				report(fmt.Errorf("echoqueue example: processing record rejected: %w", err))
+				report(fmt.Errorf("echoqueue worker: processing record rejected: %w", err))
 				kept++
 				continue
 			}
@@ -320,12 +320,12 @@ func (a *DeadArchiver) flush(ctx context.Context, records []DeadRecord) error {
 		return nil
 	}
 	if err := a.sink.PersistDead(ctx, records); err != nil {
-		return fmt.Errorf("echoqueue example: dead persist failed: %w", err)
+		return fmt.Errorf("echoqueue worker: dead persist failed: %w", err)
 	}
 	for _, record := range records {
 		removed, err := a.rdb.LRem(ctx, a.cfg.ProcessingKey, 1, record.Raw).Result()
 		if err != nil {
-			return fmt.Errorf("echoqueue example: dead ack failed for effect_id %q: %w", record.EffectID, err)
+			return fmt.Errorf("echoqueue worker: dead ack failed for effect_id %q: %w", record.EffectID, err)
 		}
 		if removed == 0 {
 			// Persisted and already removed: the record is not lost. With a

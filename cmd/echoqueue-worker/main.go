@@ -1,4 +1,4 @@
-// Command reliable_consumer is the runnable host reference for EchoQueue
+// Command echoqueue-worker is the runnable host reference for EchoQueue
 // bounded consumption and dead archiving. It wires the public EchoQueue API to
 // the bounded pool and the dead archiver, and demonstrates the required
 // ordering: acquire permit -> Dispatch -> Handle -> Settle -> release permit.
@@ -10,7 +10,7 @@
 //
 // Run with:
 //
-//	go run ./examples/reliable_consumer -addr 127.0.0.1:6379
+//	go run ./cmd/echoqueue-worker -addr 127.0.0.1:6379
 package main
 
 import (
@@ -30,23 +30,25 @@ import (
 )
 
 func main() {
+	poolDefaults := defaultPoolConfig()
+	archiverDefaults := defaultArchiverConfig()
 	addr := flag.String("addr", envOr("ECHOQUEUE_REDIS_ADDR", "127.0.0.1:6379"), "Redis address")
-	namespace := flag.String("namespace", "reliable-consumer-example", "EchoQueue namespace")
+	namespace := flag.String("namespace", "echoqueue-worker", "EchoQueue namespace")
 	taskName := flag.String("task-name", "invoice", "QueueConfig task name")
-	source := flag.String("source", "example:invoice:source", "Source list key")
-	result := flag.String("result", "example:invoice:result", "Result list key")
-	dead := flag.String("dead", "example:invoice:dead", "Dead list key")
-	processing := flag.String("processing", "example:invoice:dead-processing", "DeadProcessing list key")
-	workers := flag.Int("workers", 4, "pool worker goroutines")
-	maxInFlight := flag.Int("max-in-flight", 8, "max dispatched-not-settled batches")
-	buffer := flag.Int("buffer", 16, "pool buffer slots")
-	batchSize := flag.Int("batch-size", 1, "tasks per Dispatch call")
-	grace := flag.Duration("shutdown-grace", 5*time.Second, "grace for in-flight batches after cancellation")
-	archiveBatch := flag.Int("archive-batch", 64, "max dead records per persist batch")
+	source := flag.String("source", "echoqueue-worker:invoice:source", "Source list key")
+	result := flag.String("result", "echoqueue-worker:invoice:result", "Result list key")
+	dead := flag.String("dead", "echoqueue-worker:invoice:dead", "Dead list key")
+	processing := flag.String("processing", "echoqueue-worker:invoice:dead-processing", "DeadProcessing list key")
+	workers := flag.Int("workers", poolDefaults.Workers, "pool worker goroutines")
+	maxInFlight := flag.Int("max-in-flight", poolDefaults.MaxInFlight, "max dispatched-not-settled batches")
+	buffer := flag.Int("buffer", poolDefaults.Buffer, "pool buffer slots")
+	batchSize := flag.Int("batch-size", poolDefaults.BatchSize, "tasks per Dispatch call")
+	grace := flag.Duration("shutdown-grace", poolDefaults.ShutdownGrace, "grace for in-flight batches after cancellation")
+	archiveBatch := flag.Int("archive-batch", archiverDefaults.BatchSize, "max dead records per persist batch")
 	enableArchive := flag.Bool("enable-archive", false, "start the dead archiver; the reference logging sink does not persist, so records are claimed but never acknowledged")
 	flag.Parse()
 
-	if *dead == "" || *processing == "" || *dead == *processing {
+	if *enableArchive && (*dead == "" || *processing == "" || *dead == *processing) {
 		log.Fatal("the archiver requires an explicit, distinct dead and processing key")
 	}
 
@@ -54,6 +56,11 @@ func main() {
 	defer stop()
 
 	rdb := redis.NewClient(&redis.Options{Addr: *addr})
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			reportError(fmt.Errorf("close Redis client: %w", err))
+		}
+	}()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatalf("redis ping: %v", err)
 	}
@@ -85,7 +92,7 @@ func main() {
 		MaxInFlight:   *maxInFlight,
 		Buffer:        *buffer,
 		BatchSize:     *batchSize,
-		PollInterval:  time.Second,
+		PollInterval:  poolDefaults.PollInterval,
 		ShutdownGrace: *grace,
 	})
 	if err != nil {
@@ -93,10 +100,10 @@ func main() {
 	}
 	poolErr := make(chan error, 1)
 	go func() {
-		poolErr <- pool.Run(ctx, queue, scheduler, exampleHandler, reportError)
+		poolErr <- pool.Run(ctx, queue, scheduler, referenceHandler, reportError)
 	}()
-	// In a real host, a pool Run error (e.g. misuse) would be observed here
-	// and the pool restarted. The reference logs it.
+
+	var archiveErr <-chan error
 
 	if *enableArchive {
 		// The reference sink never persists, so enabling the archiver moves
@@ -107,16 +114,17 @@ func main() {
 			DeadKey:       *dead,
 			ProcessingKey: *processing,
 			BatchSize:     *archiveBatch,
-			FlushInterval: time.Second,
-			ClaimTimeout:  time.Second,
-			ErrorBackoff:  500 * time.Millisecond,
+			FlushInterval: archiverDefaults.FlushInterval,
+			ClaimTimeout:  archiverDefaults.ClaimTimeout,
+			ErrorBackoff:  archiverDefaults.ErrorBackoff,
 		}, LoggingDeadSink{})
 		if err != nil {
 			log.Fatalf("NewDeadArchiver: %v", err)
 		}
-		archiveErr := make(chan error, 1)
+		archiveDone := make(chan error, 1)
+		archiveErr = archiveDone
 		go func() {
-			archiveErr <- archiver.Run(ctx, reportError)
+			archiveDone <- archiver.Run(ctx, reportError)
 		}()
 		log.Printf("dead archiver enabled with the non-persisting logging sink; dead records will be claimed into %q but never deleted", *processing)
 	} else {
@@ -124,9 +132,23 @@ func main() {
 	}
 
 	log.Printf("consuming %q with %d workers, %d in-flight, %d buffer", *source, *workers, *maxInFlight, *buffer)
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-poolErr:
+		reportUnexpectedStop("worker pool", err)
+		poolErr = nil
+	case err := <-archiveErr:
+		reportUnexpectedStop("dead archiver", err)
+		archiveErr = nil
+	}
 	stop()
-	log.Printf("shutting down; unacked dead records stay in %q", *processing)
+	waitForComponent("worker pool", poolErr, *grace+time.Second)
+	waitForComponent("dead archiver", archiveErr, archiverDefaults.ClaimTimeout+archiverDefaults.ErrorBackoff+time.Second)
+	if *enableArchive {
+		log.Printf("shutting down; unacked dead records stay in %q", *processing)
+	} else {
+		log.Printf("shutting down; dead records stay in %q", *dead)
+	}
 }
 
 // runRecoveryLoop restarts Scheduler.Run until shutdown. Run errors carry the
@@ -145,10 +167,10 @@ func runRecoveryLoop(ctx context.Context, scheduler *echoqueue.Scheduler) {
 	}
 }
 
-// exampleHandler shows how a worker turns business results and failures into
-// an Outcome. Large business data must live in external storage; the Result
-// carries a reference, a size, and a hash instead.
-func exampleHandler(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome {
+// referenceHandler is intentionally minimal: it demonstrates how a worker
+// covers every task in an Outcome without pretending that a placeholder URL
+// or hash was durably produced by real business logic.
+func referenceHandler(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcome {
 	outcome := echoqueue.Outcome{RequestID: "host-worker-" + batch.ID}
 	for _, task := range batch.Tasks {
 		if ctx.Err() != nil {
@@ -161,11 +183,7 @@ func exampleHandler(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcom
 		}
 		outcome.Results = append(outcome.Results, echoqueue.Result{
 			TaskID: task.TaskID,
-			Data: json.RawMessage(`{
-				"ref": "example-bucket/` + task.TaskID + `",
-				"size": 42,
-				"sha256": "external-content-hash-here"
-			}`),
+			Data:   json.RawMessage(`{"processed":true}`),
 		})
 	}
 	return outcome
@@ -173,6 +191,28 @@ func exampleHandler(ctx context.Context, batch echoqueue.Batch) echoqueue.Outcom
 
 func reportError(err error) {
 	log.Printf("error: %v", err)
+}
+
+func reportUnexpectedStop(name string, err error) {
+	if err != nil {
+		reportError(fmt.Errorf("%s stopped: %w", name, err))
+		return
+	}
+	reportError(fmt.Errorf("%s stopped unexpectedly", name))
+}
+
+func waitForComponent(name string, done <-chan error, timeout time.Duration) {
+	if done == nil {
+		return
+	}
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			reportError(fmt.Errorf("%s shutdown: %w", name, err))
+		}
+	case <-time.After(timeout):
+		reportError(fmt.Errorf("%s did not stop within %s", name, timeout))
+	}
 }
 
 // LoggingDeadSink is a demonstration sink only: it does not persist anything
@@ -183,9 +223,9 @@ type LoggingDeadSink struct{}
 
 func (LoggingDeadSink) PersistDead(ctx context.Context, records []DeadRecord) error {
 	for _, record := range records {
-		log.Printf("example sink: would persist dead effect_id=%s (not durable, not acknowledged)", record.EffectID)
+		log.Printf("reference sink: would persist dead effect_id=%s (not durable, not acknowledged)", record.EffectID)
 	}
-	return errors.New("echoqueue example: the logging sink does not persist; nothing was acknowledged")
+	return errors.New("echoqueue worker: the logging sink does not persist; nothing was acknowledged")
 }
 
 func envOr(name, fallback string) string {
