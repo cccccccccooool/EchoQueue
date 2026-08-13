@@ -30,7 +30,7 @@ func (s *Scheduler) deferRecover(ctx context.Context, batchID string) (string, e
 		return "", fmt.Errorf("%w: %v", errDeferRecover, err)
 	}
 	if err := s.ensureRedis(ctx); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %w: redis probe: %v", errDeferRecover, ErrTransientRedis, err)
 	}
 
 	delay := s.config.RunInterval
@@ -47,7 +47,7 @@ func (s *Scheduler) deferRecover(ctx context.Context, batchID string) (string, e
 		s.keys.deadline(),
 	}, batchID, delayMillis).Result()
 	if err != nil {
-		return "", fmt.Errorf("%w: Redis script: %v", errDeferRecover, err)
+		return "", fmt.Errorf("%w: %w: Redis script: %v", errDeferRecover, ErrTransientRedis, err)
 	}
 	parts, ok := value.([]interface{})
 	if !ok || len(parts) == 0 {

@@ -53,14 +53,16 @@ func (r *Runner) drainBatches(runCtx context.Context, gen int64, handle BatchHan
 // release also covers a panicking host handle callback, so a panic can never
 // permanently shrink the token pools.
 func (r *Runner) workBatch(runCtx context.Context, gen int64, batch echoqueue.Batch, handle BatchHandler) {
-	r.cfg.Metrics.HandleStarted()
-	defer r.cfg.Metrics.HandleDone()
 	released := false
 	defer func() {
 		if !released {
 			r.release()
 		}
 	}()
+	// HandleStarted must run after the release defer is registered so a
+	// panicking metrics implementation can never leak the batch's tokens.
+	r.cfg.Metrics.HandleStarted()
+	defer r.cfg.Metrics.HandleDone()
 	outcome := handle(runCtx, batch)
 	if runCtx.Err() != nil {
 		// Handling was interrupted by cancellation: never fabricate a

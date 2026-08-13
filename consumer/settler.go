@@ -84,6 +84,12 @@ func (r *Runner) settleOutcome(runCtx context.Context, item outcomeItem, settle 
 		}
 		return
 	}
+	if r.runGen.Load() != item.gen {
+		// A newer Run started while this Settle was in flight: the terminal
+		// write already happened, but its bookkeeping must not reset the new
+		// generation's breaker counters.
+		return
+	}
 	r.cfg.Metrics.SettleSucceeded()
 	r.recordSettleSuccess()
 	if receipt.Status == echoqueue.ReceiptInvalid {
@@ -98,20 +104,30 @@ func (r *Runner) settleOutcome(runCtx context.Context, item outcomeItem, settle 
 // settlers: a success resets the streak atomically with the open state.
 func (r *Runner) recordSettleFailure() {
 	r.breakerMu.Lock()
-	defer r.breakerMu.Unlock()
+	opened := false
 	r.breakerFailures++
 	if r.breakerFailures >= breakerThreshold && !r.breakerOpen {
 		r.breakerOpen = true
+		opened = true
+	}
+	r.breakerMu.Unlock()
+	// Metrics callbacks run outside the lock so a blocking sink cannot stall
+	// breaker bookkeeping or the dispatchers' open-state checks.
+	if opened {
 		r.cfg.Metrics.BreakerOpened()
 	}
 }
 
 func (r *Runner) recordSettleSuccess() {
 	r.breakerMu.Lock()
-	defer r.breakerMu.Unlock()
+	closed := false
 	r.breakerFailures = 0
 	if r.breakerOpen {
 		r.breakerOpen = false
+		closed = true
+	}
+	r.breakerMu.Unlock()
+	if closed {
 		r.cfg.Metrics.BreakerClosed()
 	}
 }

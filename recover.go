@@ -108,14 +108,14 @@ func (s *Scheduler) recoverBatch(ctx context.Context, batchID string) (Receipt, 
 		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %v", errRecover, err)
 	}
 	if err := s.ensureRedis(ctx); err != nil {
-		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, err
+		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %w: redis probe: %v", errRecover, ErrTransientRedis, err)
 	}
 	pendingKey := s.keys.pending(batchID)
 	receiptKey := s.keys.receipt(batchID)
 	deadlineKey := s.keys.deadline()
 	pendingRaw, pendingErr := s.rdb.Get(ctx, pendingKey).Result()
 	if pendingErr != nil && pendingErr != redis.Nil {
-		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: read pending: %v", errRecover, pendingErr)
+		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %w: read pending: %v", errRecover, ErrTransientRedis, pendingErr)
 	}
 	retryTasks := make([]Task, 0)
 	deadRecords := make([]deadRecord, 0)
@@ -159,7 +159,7 @@ func (s *Scheduler) recoverBatch(ctx context.Context, batchID string) (Receipt, 
 	value, err := recoverScript.Eval(ctx, s.rdb, []string{pendingKey, receiptKey, deadlineKey, sourceKey, deadKey},
 		batchID, recoverRequest, recoverHash, string(receiptJSON), string(retryJSON), string(deadJSON), s.config.ReceiptTTL.Milliseconds()).Result()
 	if err != nil {
-		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: Redis script: %v", errRecover, err)
+		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: %w: Redis script: %v", errRecover, ErrTransientRedis, err)
 	}
 	return parseReceiptResponse(batchID, value, errRecover)
 }

@@ -233,6 +233,7 @@ runner, err := consumer.New(consumer.Config{
 - permit 与 batch slot 在 Dispatch 之前取得：流水线满时停止 Dispatch，任务留在 Source；已 Dispatch 批次总能立即进入有界通道。
 - Dispatcher/Handler/Settler/in-flight 批次全部硬上限；慢 Handler 形成背压而非无界预取。Dispatchers 超过 1~4 通常无益，Redis Lua 在服务端串行执行。
 - Settle 连续失败 3 次触发熔断：暂停 Dispatch，按带抖动的 ErrorBackoff 半开探测，Settle 成功后恢复，避免 Redis 故障期间无界预取。只有包装 `echoqueue.ErrTransientRedis` 的瞬时 Redis 交互错误计数熔断，校验/业务拒绝（`ReceiptInvalid`）不计数。
+- 注意：半开探测会以 ErrorBackoff 间隔消耗真实任务（探测批次若 Settle 仍失败，由 Recover 重投直至 MaxRetry 后进 Dead）；完全宕机时探测在 Dispatch 阶段即失败、不消耗任务。若无法接受抖动期死信消耗，应调大 ErrorBackoff。
 - Dispatch 后进程退出：批次已有 Pending/deadline，由 Recover 接管；流水线只是背压与短期缓冲，不是可靠状态来源。
 - 关闭：context 取消后停止新 Dispatch；Handler/Settler 在 ShutdownGrace 内排干已 Dispatch 批次与已计算 Outcome，超时后剩余批次连同容量归还、交由 Recover。世代守卫保证旧世代 outcome 不跨代结算。
 - 注意：排干期间 Handler 会继续完成已取得的批次，业务副作用可能在 context 取消后仍然发生；需要严格停止语义的宿主应在 Handler 内部检查自己的业务 context。

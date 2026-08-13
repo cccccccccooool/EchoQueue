@@ -20,7 +20,7 @@ var settleScript = redis.NewScript(settleScriptSource)
 
 var errSettle = errors.New("echoqueue: settle failed")
 
-// ErrTransientRedis is wrapped into Settle errors caused by transient Redis
+// ErrTransientRedis is wrapped into library errors caused by transient Redis
 // interactions (capability probe, Pending read, or script execution), as
 // opposed to validation or business rejections. Hosts match it with
 // errors.Is to decide whether to back off or trip a circuit breaker.
@@ -200,6 +200,11 @@ func buildOutcomeEffects(snapshot pendingSnapshot, outcome Outcome) ([]resultRec
 	return results, retries, dead, nil
 }
 
+// parseReceiptResponse converts a script reply into a Receipt. Errors here
+// are deliberately NOT wrapped with ErrTransientRedis: the script executed
+// successfully on the server, so a malformed reply means a protocol or code
+// mismatch (permanent), not a transient network failure. The Lua "invalid"
+// status is a business rejection and likewise stays non-transient.
 func parseReceiptResponse(batchID string, value interface{}, operationErr error) (Receipt, error) {
 	parts, ok := value.([]interface{})
 	if !ok || len(parts) == 0 {
