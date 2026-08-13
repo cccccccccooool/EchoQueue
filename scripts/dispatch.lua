@@ -46,15 +46,11 @@ if deadlineType ~= 'none' and deadlineType ~= 'zset' then
     return {"invalid", "deadline key has wrong type"}
 end
 
-local length = redis.call('LLEN', sourceKey)
-if length == 0 then
-    return {"empty"}
-end
-
-local count = batchSize
-if count > length then count = length end
-local start = length - count
-local rawItems = redis.call('LRANGE', sourceKey, start, length - 1)
+-- Peek the tail window read-only so validation failures leave the source
+-- untouched; the window is popped only after it is known to be valid. The
+-- list cannot change between LRANGE and RPOP because the script runs
+-- atomically.
+local rawItems = redis.call('LRANGE', sourceKey, -batchSize, -1)
 if not rawItems or #rawItems == 0 then
     return {"empty"}
 end
@@ -126,12 +122,9 @@ local pendingJSON = cjson.encode(base)
 if not redis.call('SET', pendingKey, pendingJSON, 'NX') then
     return {"invalid", "pending key already exists"}
 end
+-- Pop the validated tail window in one command (RPOP with count, Redis 6.2+).
+redis.call('RPOP', sourceKey, batchSize)
 redis.call('ZADD', deadlineKey, deadlineAt, batchID)
-if start == 0 then
-    redis.call('DEL', sourceKey)
-else
-    redis.call('LTRIM', sourceKey, 0, start - 1)
-end
 
 local result = {"applied", batchID, tostring(createdAt), tostring(deadlineAt), tostring(#tasks)}
 for _, encoded in ipairs(tasks) do table.insert(result, encoded) end

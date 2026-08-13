@@ -13,7 +13,11 @@ import (
 )
 
 //go:embed scripts/recover.lua
-var recoverScript string
+var recoverScriptSource string
+
+// recoverScript runs the embedded script through EVALSHA with an automatic
+// EVAL fallback, so the recovery loop never resends the script body.
+var recoverScript = redis.NewScript(recoverScriptSource)
 
 var errRecover = errors.New("echoqueue: recover failed")
 
@@ -152,7 +156,7 @@ func (s *Scheduler) recoverBatch(ctx context.Context, batchID string) (Receipt, 
 	}
 	retryJSON, _ := json.Marshal(retryTasks)
 	deadJSON, _ := json.Marshal(deadRecords)
-	value, err := s.rdb.Eval(ctx, recoverScript, []string{pendingKey, receiptKey, deadlineKey, sourceKey, deadKey},
+	value, err := recoverScript.Eval(ctx, s.rdb, []string{pendingKey, receiptKey, deadlineKey, sourceKey, deadKey},
 		batchID, recoverRequest, recoverHash, string(receiptJSON), string(retryJSON), string(deadJSON), s.config.ReceiptTTL.Milliseconds()).Result()
 	if err != nil {
 		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: Redis script: %v", errRecover, err)

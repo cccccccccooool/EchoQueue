@@ -6,10 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 //go:embed scripts/defer_recover.lua
-var deferRecoverScript string
+var deferRecoverScriptSource string
+
+// deferRecoverScript runs the embedded script through EVALSHA with an
+// automatic EVAL fallback.
+var deferRecoverScript = redis.NewScript(deferRecoverScriptSource)
 
 var errDeferRecover = errors.New("echoqueue: defer recover failed")
 
@@ -35,7 +41,7 @@ func (s *Scheduler) deferRecover(ctx context.Context, batchID string) (string, e
 	if delayMillis < 1 {
 		delayMillis = 1
 	}
-	value, err := s.rdb.Eval(ctx, deferRecoverScript, []string{
+	value, err := deferRecoverScript.Eval(ctx, s.rdb, []string{
 		s.keys.pending(batchID),
 		s.keys.receipt(batchID),
 		s.keys.deadline(),

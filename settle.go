@@ -12,7 +12,11 @@ import (
 )
 
 //go:embed scripts/settle.lua
-var settleScript string
+var settleScriptSource string
+
+// settleScript runs the embedded script through EVALSHA with an automatic
+// EVAL fallback, so the hot path never resends the script body.
+var settleScript = redis.NewScript(settleScriptSource)
 
 var errSettle = errors.New("echoqueue: settle failed")
 
@@ -106,7 +110,7 @@ func (s *Scheduler) Settle(ctx context.Context, batchID string, outcome Outcome)
 	resultJSON, _ := json.Marshal(resultRecords)
 	retryJSON, _ := json.Marshal(retryTasks)
 	deadJSON, _ := json.Marshal(deadRecords)
-	value, err := s.rdb.Eval(ctx, settleScript, []string{pendingKey, receiptKey, deadlineKey, resultKey, sourceKey, deadKey},
+	value, err := settleScript.Eval(ctx, s.rdb, []string{pendingKey, receiptKey, deadlineKey, resultKey, sourceKey, deadKey},
 		batchID, outcome.RequestID, command, string(receiptJSON), string(resultJSON), string(retryJSON), string(deadJSON), s.config.ReceiptTTL.Milliseconds()).Result()
 	if err != nil {
 		return Receipt{Status: ReceiptInvalid, BatchID: batchID}, fmt.Errorf("%w: Redis script: %v", errSettle, err)
