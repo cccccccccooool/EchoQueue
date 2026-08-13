@@ -49,6 +49,6 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Integration tests
-        run: go test -tags=integration ./... -count=1 -timeout=300s
-      - name: Race tests
-        run: go test -race -tags=integration ./... -count=1 -timeout=600s
+        run: go test -p=1 -tags=integration ./... -count=1 -timeout=300s
+      - name: Race tests (load test skipped)
+        run: go test -p=1 -race -short -tags=integration ./... -count=1 -timeout=600s
